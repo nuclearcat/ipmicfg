@@ -1,0 +1,18 @@
+[package]
+name = "ipmicfg"
+version = "0.1.0"
+edition = "2021"
+authors = ["nuclearcat <nuclearcat@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "An intuitive IPMI/BMC tool for initial configuration, monitoring and inventory, built on ipmi-rs"
+repository = "https://github.com/datdenkikniet/ipmi-rs"
+keywords = ["ipmi", "bmc", "sysadmin", "monitoring"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+ipmi-rs = { git = "https://github.com/datdenkikniet/ipmi-rs.git" }
+
+[profile.release]
+strip = true
+lto = true
