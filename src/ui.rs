@@ -79,7 +79,7 @@ pub fn header(title: &str) {
 
 /// Print an aligned `key: value` pair, with the key right-padded to `width`.
 pub fn kv(key: &str, value: &str, width: usize) {
-    println!("  {:<width$}  {}", dim(key), value, width = width);
+    println!("  {}  {}", dim(&format!("{key:<width$}")), value);
 }
 
 /// A minimal left-aligned table renderer that respects per-column widths and
