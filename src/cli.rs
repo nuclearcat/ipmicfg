@@ -110,6 +110,14 @@ pub enum Command {
 
     /// Query or control chassis power.
     Power(PowerArgs),
+
+    /// Blink the chassis identify (locate) LED.
+    #[command(alias = "blink")]
+    Identify(IdentifyArgs),
+
+    /// Maintain the BMC itself: reset it or run its self test.
+    #[command(alias = "mc")]
+    Bmc(BmcArgs),
 }
 
 #[derive(Args)]
@@ -190,9 +198,53 @@ pub struct LanSetArgs {
 }
 
 #[derive(Args)]
+pub struct BmcArgs {
+    #[command(subcommand)]
+    pub action: BmcAction,
+}
+
+#[derive(Subcommand, Clone, Copy)]
+pub enum BmcAction {
+    /// Restart the BMC. The host keeps running, but the BMC (and this
+    /// connection) goes offline for a minute or two.
+    Reset {
+        /// Warm reset: restart firmware without fully reinitializing
+        /// interfaces (cold is the default and works on more BMCs).
+        #[arg(long)]
+        warm: bool,
+
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Report the BMC self test result.
+    Selftest,
+}
+
+#[derive(Args)]
 pub struct PowerArgs {
     #[command(subcommand)]
     pub action: Option<PowerAction>,
+}
+
+#[derive(Args)]
+pub struct IdentifyArgs {
+    #[command(subcommand)]
+    pub action: Option<IdentifyAction>,
+}
+
+#[derive(Subcommand, Clone, Copy)]
+pub enum IdentifyAction {
+    /// Blink the LED for a number of seconds (default).
+    On {
+        /// Duration in seconds (0 turns the LED off).
+        #[arg(default_value_t = 15, value_name = "SECONDS")]
+        seconds: u8,
+    },
+    /// Keep the LED on until explicitly turned off.
+    Force,
+    /// Turn the LED off.
+    Off,
 }
 
 #[derive(Subcommand, Clone, Copy)]
