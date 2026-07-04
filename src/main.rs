@@ -3,7 +3,7 @@
 //! Built on top of the pure-Rust [`ipmi-rs`](https://github.com/datdenkikniet/ipmi-rs)
 //! library. Provides three pillars of day-to-day BMC work:
 //!
-//! * **Initial configuration** — `lan show` / `lan set`, `power`
+//! * **Initial configuration** — `lan show` / `lan set`, `power`, `identify`, `bmc`
 //! * **Monitoring** — `status`, `sensors`, `sel`
 //! * **Inventory** — `inventory` (FRU + device discovery)
 
@@ -43,5 +43,7 @@ fn run(cli: &Cli) -> Result<(), String> {
         Command::Inventory => cmd::inventory::run(&mut conn),
         Command::Lan(args) => cmd::lan::run(&mut conn, args),
         Command::Power(args) => cmd::power::run(&mut conn, args),
+        Command::Identify(args) => cmd::identify::run(&mut conn, args),
+        Command::Bmc(args) => cmd::bmc::run(&mut conn, args),
     }
 }

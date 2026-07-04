@@ -1,5 +1,7 @@
 //! Subcommand implementations.
 
+pub mod bmc;
+pub mod identify;
 pub mod inventory;
 pub mod lan;
 pub mod power;
