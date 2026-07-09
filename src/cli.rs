@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::conn::Target;
 
@@ -29,7 +29,13 @@ pub struct ConnOpts {
     pub host: Option<String>,
 
     /// Local IPMI device path (used when --host is not given).
-    #[arg(short, long, global = true, default_value = "/dev/ipmi0", value_name = "PATH")]
+    #[arg(
+        short,
+        long,
+        global = true,
+        default_value = "/dev/ipmi0",
+        value_name = "PATH"
+    )]
     pub device: String,
 
     /// Response timeout in milliseconds.
@@ -126,9 +132,37 @@ pub struct SensorsArgs {
     #[arg(short, long, value_name = "TYPE")]
     pub r#type: Vec<String>,
 
+    /// Only show sensors whose name contains this string.
+    #[arg(short, long, value_name = "PATTERN")]
+    pub name: Vec<String>,
+
+    /// Only show sensors with this health state.
+    #[arg(long, value_enum, value_name = "STATE")]
+    pub state: Vec<SensorState>,
+
     /// Also list discrete (non-analog) sensors.
     #[arg(long)]
     pub all: bool,
+
+    /// Display configured threshold values for analog sensors.
+    #[arg(long)]
+    pub thresholds: bool,
+
+    /// Refresh readings every N seconds until interrupted.
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub watch: Option<u64>,
+
+    /// Show individual sensor read errors.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SensorState {
+    Ok,
+    Warn,
+    Critical,
+    Unknown,
 }
 
 #[derive(Args)]
@@ -140,6 +174,37 @@ pub struct SelArgs {
     /// multi-part OEM text messages into a single row.
     #[arg(long)]
     pub raw: bool,
+
+    /// Only show entries at or after this RFC 3339 or Unix timestamp.
+    #[arg(long, value_name = "TIME")]
+    pub since: Option<String>,
+
+    /// Only show entries at or before this RFC 3339 or Unix timestamp.
+    #[arg(long, value_name = "TIME")]
+    pub until: Option<String>,
+
+    /// Only show entries whose sensor name/type contains this string.
+    #[arg(long, value_name = "PATTERN")]
+    pub sensor: Option<String>,
+
+    /// Only show entries with the inferred severity.
+    #[arg(long, value_enum, value_name = "SEVERITY")]
+    pub severity: Option<SelSeverity>,
+
+    /// Show at most the newest N matching entries.
+    #[arg(long, value_name = "N", value_parser = parse_positive_usize)]
+    pub limit: Option<usize>,
+
+    /// Keep polling and print newly added matching entries.
+    #[arg(long)]
+    pub follow: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SelSeverity {
+    Normal,
+    Warning,
+    Critical,
 }
 
 #[derive(Subcommand)]
@@ -154,6 +219,40 @@ pub enum SelAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Delete one SEL entry (when supported by the BMC).
+    Delete {
+        /// Record ID, in decimal or hexadecimal (for example `0x003A`).
+        #[arg(value_parser = parse_u16)]
+        record_id: u16,
+
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+fn parse_u16(value: &str) -> Result<u16, String> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u16::from_str_radix(hex, 16).map_err(|_| format!("invalid record ID '{value}'"))
+    } else {
+        value
+            .parse::<u16>()
+            .map_err(|_| format!("invalid record ID '{value}'"))
+    }
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer '{value}'"))?;
+    if parsed == 0 {
+        Err("value must be greater than zero".to_string())
+    } else {
+        Ok(parsed)
+    }
 }
 
 #[derive(Args)]
@@ -263,4 +362,48 @@ pub enum PowerAction {
     Soft,
     /// Pulse a diagnostic interrupt (NMI).
     Diag,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sensor_monitoring_options() {
+        let cli = Cli::try_parse_from([
+            "ipmicfg",
+            "sensors",
+            "--name",
+            "CPU",
+            "--state",
+            "critical",
+            "--thresholds",
+            "--watch",
+            "5",
+        ])
+        .expect("valid sensor arguments");
+        let Command::Sensors(args) = cli.command else {
+            panic!("expected sensors command");
+        };
+        assert_eq!(args.name, ["CPU"]);
+        assert_eq!(args.state, [SensorState::Critical]);
+        assert!(args.thresholds);
+        assert_eq!(args.watch, Some(5));
+    }
+
+    #[test]
+    fn parses_hex_sel_record_id() {
+        let cli = Cli::try_parse_from(["ipmicfg", "sel", "delete", "0x003A", "--yes"])
+            .expect("valid SEL delete arguments");
+        let Command::Sel(args) = cli.command else {
+            panic!("expected sel command");
+        };
+        assert!(matches!(
+            args.action,
+            Some(SelAction::Delete {
+                record_id: 0x003A,
+                yes: true
+            })
+        ));
+    }
 }

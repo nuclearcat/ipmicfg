@@ -58,11 +58,17 @@ ipmicfg status
 # All sensors, or just temperatures and fans
 ipmicfg sensors
 ipmicfg sensors --type Temp --type Fan
-ipmicfg sensors --all              # also list discrete sensors
+ipmicfg sensors --all              # discrete sensors include asserted states
+ipmicfg sensors --name CPU --state critical
+ipmicfg sensors --thresholds
+ipmicfg sensors --watch 5
 
 # System Event Log
 ipmicfg sel                        # list
 ipmicfg sel info                   # summary
+ipmicfg sel --since 2026-07-01T00:00:00Z --severity critical --limit 20
+ipmicfg sel --sensor PSU --follow
+ipmicfg sel delete 0x003A          # delete one entry when supported
 ipmicfg sel clear                  # erase (asks for confirmation; --yes to skip)
 
 # Inventory (FRU + discovered devices)

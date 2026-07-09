@@ -12,9 +12,8 @@ static COLOR_ENABLED: AtomicBool = AtomicBool::new(false);
 ///
 /// `force_off` corresponds to the `--no-color` flag.
 pub fn init_color(force_off: bool) {
-    let enabled = !force_off
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::io::stdout().is_terminal();
+    let enabled =
+        !force_off && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
     COLOR_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
@@ -50,7 +49,7 @@ pub fn cyan(s: &str) -> String {
 }
 
 /// Health status used to color sensor readings, power state, etc.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Ok,
     Warn,
@@ -153,7 +152,12 @@ impl Table {
         // Header
         let mut line = String::from("  ");
         for (i, h) in self.headers.iter().enumerate() {
-            line.push_str(&pad(&dim(&bold(h)), h.chars().count(), widths[i], self.align(i)));
+            line.push_str(&pad(
+                &dim(&bold(h)),
+                h.chars().count(),
+                widths[i],
+                self.align(i),
+            ));
             if i + 1 < ncols {
                 line.push_str("  ");
             }

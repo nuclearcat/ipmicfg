@@ -29,7 +29,10 @@ pub fn run(conn: &mut Conn) -> Result<(), String> {
     if let Some(aux) = dev.aux_revision {
         ui::kv(
             "Aux firmware",
-            &format!("{:02X} {:02X} {:02X} {:02X}", aux[0], aux[1], aux[2], aux[3]),
+            &format!(
+                "{:02X} {:02X} {:02X} {:02X}",
+                aux[0], aux[1], aux[2], aux[3]
+            ),
             18,
         );
     }
@@ -53,9 +56,7 @@ pub fn run(conn: &mut Conn) -> Result<(), String> {
     for record in &records {
         let (kind, name) = match &record.contents {
             RecordContents::FruDeviceLocator(fru) => ("FRU device", fru.id_string().to_string()),
-            RecordContents::McDeviceLocator(mc) => {
-                ("Mgmt controller", mc.id_string().to_string())
-            }
+            RecordContents::McDeviceLocator(mc) => ("Mgmt controller", mc.id_string().to_string()),
             RecordContents::GenericDeviceLocator(g) => ("Device", g.id_string().to_string()),
             _ => continue,
         };

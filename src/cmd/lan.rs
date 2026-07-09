@@ -43,7 +43,10 @@ fn show(conn: &mut Conn) -> Result<(), String> {
             "Address source",
             fetch(conn, channel, LanConfigParameter::IpAddressSource),
         );
-        kv_opt("IP address", fetch(conn, channel, LanConfigParameter::IpAddress));
+        kv_opt(
+            "IP address",
+            fetch(conn, channel, LanConfigParameter::IpAddress),
+        );
         kv_opt(
             "Subnet mask",
             fetch(conn, channel, LanConfigParameter::SubnetMask),
@@ -128,7 +131,9 @@ fn set(conn: &mut Conn, args: &LanSetArgs) -> Result<(), String> {
 
     let mut errors = Vec::new();
     for (param, request, desc) in changes {
-        match conn.send_recv(SetLanConfigParameters::from_request(channel, param, request)) {
+        match conn.send_recv(SetLanConfigParameters::from_request(
+            channel, param, request,
+        )) {
             Ok(_) => println!("  {} {desc}", ui::green("set")),
             Err(e) => {
                 println!("  {} {desc}: {e:?}", ui::red("fail"));
@@ -153,7 +158,9 @@ fn set(conn: &mut Conn, args: &LanSetArgs) -> Result<(), String> {
 
 /// Fetch a single LAN parameter and render it as a string, if available.
 fn fetch(conn: &mut Conn, channel: Channel, param: LanConfigParameter) -> Option<String> {
-    let resp = conn.send_recv(GetLanConfigParameters::new(channel, param)).ok()?;
+    let resp = conn
+        .send_recv(GetLanConfigParameters::new(channel, param))
+        .ok()?;
     match resp.parse(param).ok()? {
         LanConfigParameterData::IpAddress(v) => Some(v.to_string()),
         LanConfigParameterData::SubnetMask(v) => Some(v.to_string()),
