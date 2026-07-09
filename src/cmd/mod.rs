@@ -2,10 +2,12 @@
 
 pub mod bmc;
 pub mod boot;
+mod fujitsu;
 pub mod identify;
 pub mod inventory;
 pub mod lan;
 pub mod power;
+pub mod raw;
 pub mod sel;
 pub mod sensors;
 pub mod status;

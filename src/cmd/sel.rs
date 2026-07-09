@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use ipmi_rs::app::GetDeviceId;
 use ipmi_rs::connection::NetFn;
 use ipmi_rs::storage::sdr::record::{IdentifiableSensor, InstancedSensor, RecordContents};
 use ipmi_rs::storage::sdr::SensorType;
@@ -14,9 +15,14 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::cli::{SelAction, SelArgs, SelSeverity};
-use crate::cmd::confirm;
+use crate::cmd::{confirm, fujitsu};
 use crate::conn::Conn;
 use crate::ui::{self, Align, Cell, Table};
+
+type SensorNames = HashMap<(u8, u8), String>;
+type OemDecodedEntries = HashMap<u16, fujitsu::DecodedSelEntry>;
+
+const FUJITSU_MANUFACTURER_IDS: [u32; 3] = [0x00000E, 0x000137, 0x002880];
 
 pub fn run(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
     match args.action.as_ref().unwrap_or(&SelAction::List) {
@@ -24,6 +30,9 @@ pub fn run(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
         SelAction::Info => info(conn),
         SelAction::Clear { yes } => clear(conn, *yes),
         SelAction::Delete { record_id, yes } => delete(conn, *record_id, *yes),
+        SelAction::Decode { record_ids, debug } => {
+            fujitsu::decode_sel_entries(conn, record_ids, *debug)
+        }
     }
 }
 
@@ -62,12 +71,15 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
     } else {
         read_entries(conn)?
     };
+    let decode_fujitsu_oem = !args.no_oem_decode && is_fujitsu_irmc(conn);
+    let decoded = decode_oem_entries(conn, &entries, decode_fujitsu_oem);
     let mut known: HashSet<u16> = entries
         .iter()
         .map(|entry| entry_id(entry).value())
         .collect();
     print_entries(
         entries,
+        &decoded,
         args,
         &names,
         since,
@@ -97,7 +109,8 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
             .filter(|entry| known.insert(entry_id(entry).value()))
             .collect::<Vec<_>>();
         if !fresh.is_empty() {
-            print_entries(fresh, args, &names, since, until, None);
+            let decoded = decode_oem_entries(conn, &fresh, decode_fujitsu_oem);
+            print_entries(fresh, &decoded, args, &names, since, until, None);
         }
     }
 }
@@ -128,8 +141,9 @@ fn read_entries(conn: &mut Conn) -> Result<Vec<Entry>, String> {
 
 fn print_entries(
     entries: Vec<Entry>,
+    decoded: &OemDecodedEntries,
     args: &SelArgs,
-    names: &HashMap<u8, String>,
+    names: &SensorNames,
     since: Option<i64>,
     until: Option<i64>,
     heading: Option<(u16, bool)>,
@@ -148,7 +162,7 @@ fn print_entries(
 
     let mut entries = entries
         .into_iter()
-        .filter(|entry| matches_entry(entry, args, names, since, until))
+        .filter(|entry| matches_entry(entry, decoded, args, names, since, until))
         .collect::<Vec<_>>();
     if let Some(limit) = args.limit {
         if entries.len() > limit {
@@ -184,10 +198,12 @@ fn print_entries(
                     format!("OEM 0x{:02X}", group.ty)
                 };
                 let text = format!("\"{}\"", group.text);
-                let (severity, rendered_severity) = severity_label(SelSeverity::Warning);
+                let inferred =
+                    severity_from_description(&group.text).unwrap_or(SelSeverity::Unknown);
+                let (severity, rendered_severity) = severity_label(inferred);
                 table.row(vec![
                     Cell::new(format!("0x{:04X}", group.first_id.value())),
-                    Cell::new(ui::dim("—")),
+                    Cell::colored("—", ui::dim("—")),
                     Cell::colored(severity, rendered_severity),
                     Cell::new(label),
                     Cell::colored(text.clone(), ui::cyan(&text)),
@@ -196,7 +212,7 @@ fn print_entries(
                 continue;
             }
         }
-        push_entry(&mut table, &entries[i], names);
+        push_entry(&mut table, &entries[i], names, decoded);
         i += 1;
     }
 
@@ -204,31 +220,90 @@ fn print_entries(
     println!();
 }
 
-fn sensor_names(conn: &mut Conn) -> Result<HashMap<u8, String>, String> {
+fn sensor_names(conn: &mut Conn) -> Result<SensorNames, String> {
     Ok(conn
         .collect_sdrs()?
         .iter()
         .filter_map(|record| match &record.contents {
             RecordContents::FullSensor(sensor) => Some((
-                sensor.key_data().sensor_number.get(),
+                ((*sensor.ty()).into(), sensor.key_data().sensor_number.get()),
                 sensor.id_string().to_string(),
             )),
             RecordContents::CompactSensor(sensor) => Some((
-                sensor.key_data().sensor_number.get(),
+                ((*sensor.ty()).into(), sensor.key_data().sensor_number.get()),
                 sensor.id_string().to_string(),
             )),
-            RecordContents::EventOnlySensor(sensor) => {
-                Some((sensor.key.sensor_number.get(), sensor.id_string.to_string()))
-            }
+            RecordContents::EventOnlySensor(sensor) => Some((
+                (sensor.ty.into(), sensor.key.sensor_number.get()),
+                sensor.id_string.to_string(),
+            )),
             _ => None,
         })
         .collect())
 }
 
+fn is_fujitsu_irmc(conn: &mut Conn) -> bool {
+    conn.send_recv(GetDeviceId)
+        .is_ok_and(|device| FUJITSU_MANUFACTURER_IDS.contains(&device.manufacturer_id))
+}
+
+/// Decode only records whose sensor or event type is in an OEM-defined range.
+/// Standard IPMI records already have local descriptions and decoding every SEL
+/// row would add unnecessary controller traffic.
+fn should_decode_oem(entry: &Entry) -> bool {
+    matches!(
+        entry,
+        Entry::System {
+            sensor_type,
+            event_type,
+            ..
+        } if *sensor_type >= 0xC0 || *event_type >= 0x70
+    )
+}
+
+fn decode_oem_entries(conn: &mut Conn, entries: &[Entry], enabled: bool) -> OemDecodedEntries {
+    if !enabled {
+        return HashMap::new();
+    }
+
+    let mut decoded = HashMap::new();
+    let mut had_success = false;
+    for entry in entries.iter().filter(|entry| should_decode_oem(entry)) {
+        let record_id = entry_id(entry).value();
+        match fujitsu::fetch_long_text(conn, record_id, false) {
+            Ok(value) => {
+                decoded.insert(record_id, value);
+                had_success = true;
+            }
+            // A Fujitsu-branded controller without F5 43 support should incur
+            // only one failed probe. Once decoding has worked, an isolated bad
+            // record falls back to the generic rendering without hiding later
+            // records.
+            Err(_) if !had_success => break,
+            Err(_) => {}
+        }
+    }
+    decoded
+}
+
+fn displayed_severity(entry: &Entry, decoded: &OemDecodedEntries) -> SelSeverity {
+    match decoded
+        .get(&entry_id(entry).value())
+        .map(|entry| entry.severity)
+    {
+        Some(fujitsu::Severity::Informational) => SelSeverity::Normal,
+        Some(fujitsu::Severity::Minor) => SelSeverity::Warning,
+        Some(fujitsu::Severity::Major | fujitsu::Severity::Critical) => SelSeverity::Critical,
+        Some(fujitsu::Severity::Unknown) => SelSeverity::Unknown,
+        None => entry_severity(entry),
+    }
+}
+
 fn matches_entry(
     entry: &Entry,
+    decoded: &OemDecodedEntries,
     args: &SelArgs,
-    names: &HashMap<u8, String>,
+    names: &SensorNames,
     since: Option<i64>,
     until: Option<i64>,
 ) -> bool {
@@ -243,7 +318,11 @@ fn matches_entry(
         }
     }
     if let Some(pattern) = &args.sensor {
-        let haystack = entry_sensor(entry, names);
+        let mut haystack = entry_sensor(entry, names);
+        if let Some(oem) = decoded.get(&entry_id(entry).value()) {
+            haystack.push(' ');
+            haystack.push_str(&oem.text);
+        }
         if !haystack
             .to_ascii_lowercase()
             .contains(&pattern.to_ascii_lowercase())
@@ -252,7 +331,7 @@ fn matches_entry(
         }
     }
     args.severity
-        .is_none_or(|severity| entry_severity(entry) == severity)
+        .is_none_or(|severity| displayed_severity(entry, decoded) == severity)
 }
 
 fn parse_time(value: &str) -> Result<i64, String> {
@@ -290,7 +369,7 @@ fn entry_id(entry: &Entry) -> RecordId {
     }
 }
 
-fn entry_sensor(entry: &Entry, names: &HashMap<u8, String>) -> String {
+fn entry_sensor(entry: &Entry, names: &SensorNames) -> String {
     match entry {
         Entry::System {
             sensor_type,
@@ -298,7 +377,7 @@ fn entry_sensor(entry: &Entry, names: &HashMap<u8, String>) -> String {
             ..
         } => {
             let ty = SensorType::from(*sensor_type);
-            match names.get(sensor_number) {
+            match names.get(&(*sensor_type, *sensor_number)) {
                 Some(name) => format!("{name} ({ty} #{sensor_number})"),
                 None => format!("{ty} #{sensor_number}"),
             }
@@ -318,7 +397,7 @@ pub fn entry_severity(entry: &Entry) -> SelSeverity {
         ..
     } = entry
     else {
-        return SelSeverity::Warning;
+        return SelSeverity::Unknown;
     };
     if *event_direction == EventDirection::Deassert {
         return SelSeverity::Normal;
@@ -327,11 +406,19 @@ pub fn entry_severity(entry: &Entry) -> SelSeverity {
         return match event_data.offset {
             0 | 1 | 6 | 7 => SelSeverity::Warning,
             2..=5 | 8..=11 => SelSeverity::Critical,
-            _ => SelSeverity::Warning,
+            _ => SelSeverity::Unknown,
         };
     }
 
     let description = entry_description(entry).to_ascii_lowercase();
+    if description.is_empty() {
+        return SelSeverity::Unknown;
+    }
+    severity_from_description(&description).unwrap_or(SelSeverity::Warning)
+}
+
+fn severity_from_description(description: &str) -> Option<SelSeverity> {
+    let description = description.to_ascii_lowercase();
     if [
         "failure",
         "failed",
@@ -342,18 +429,35 @@ pub fn entry_severity(entry: &Entry) -> SelSeverity {
         "thermal trip",
         "uncorrectable",
         "limit exceeded",
+        "softlockup",
+        "hung task",
+        "kernel panic",
+        "fatal",
     ]
     .iter()
     .any(|word| description.contains(word))
     {
-        SelSeverity::Critical
-    } else if ["present", "enabled", "fully redundant", "power on"]
+        Some(SelSeverity::Critical)
+    } else if [
+        "present",
+        "enabled",
+        "fully redundant",
+        "power on",
+        "running",
+        "recovered",
+        "restored",
+    ]
+    .iter()
+    .any(|word| description.contains(word))
+    {
+        Some(SelSeverity::Normal)
+    } else if ["warning", "degraded", "predictive"]
         .iter()
         .any(|word| description.contains(word))
     {
-        SelSeverity::Normal
+        Some(SelSeverity::Warning)
     } else {
-        SelSeverity::Warning
+        None
     }
 }
 
@@ -362,6 +466,7 @@ fn severity_label(severity: SelSeverity) -> (&'static str, String) {
         SelSeverity::Normal => ("normal", ui::green("normal")),
         SelSeverity::Warning => ("warning", ui::yellow("warning")),
         SelSeverity::Critical => ("critical", ui::red("critical")),
+        SelSeverity::Unknown => ("unknown", ui::dim("unknown")),
     }
 }
 
@@ -419,7 +524,7 @@ fn oem_text_group(entries: &[Entry]) -> Option<OemText> {
     })
 }
 
-fn push_entry(table: &mut Table, entry: &Entry, names: &HashMap<u8, String>) {
+fn push_entry(table: &mut Table, entry: &Entry, names: &SensorNames, decoded: &OemDecodedEntries) {
     match entry {
         Entry::System {
             record_id,
@@ -427,13 +532,13 @@ fn push_entry(table: &mut Table, entry: &Entry, names: &HashMap<u8, String>) {
             ..
         } => {
             let sensor = entry_sensor(entry, names);
-            let desc = entry_description(entry);
-            let desc = if desc.is_empty() {
-                ui::dim("(no description)")
-            } else {
-                desc
+            let oem = decoded.get(&record_id.value());
+            let desc = match oem {
+                Some(oem) if oem.css => format!("{} (CSS component)", oem.text),
+                Some(oem) => oem.text.clone(),
+                None => display_entry_description(entry),
             };
-            let (severity, rendered_severity) = severity_label(entry_severity(entry));
+            let (severity, rendered_severity) = severity_label(displayed_severity(entry, decoded));
             table.row(vec![
                 Cell::new(format!("0x{:04X}", record_id.value())),
                 Cell::new(timestamp.to_string()),
@@ -466,7 +571,7 @@ fn push_entry(table: &mut Table, entry: &Entry, names: &HashMap<u8, String>) {
             let (severity, rendered_severity) = severity_label(entry_severity(entry));
             table.row(vec![
                 Cell::new(format!("0x{:04X}", record_id.value())),
-                Cell::new(ui::dim("—")),
+                Cell::colored("—", ui::dim("—")),
                 Cell::colored(severity, rendered_severity),
                 Cell::new(format!("OEM 0x{ty:02X}")),
                 Cell::new(oem_dump(data)),
@@ -477,6 +582,45 @@ fn push_entry(table: &mut Table, entry: &Entry, names: &HashMap<u8, String>) {
 
 pub fn entry_description(entry: &Entry) -> String {
     Desc(entry).to_string()
+}
+
+fn display_entry_description(entry: &Entry) -> String {
+    let decoded = entry_description(entry);
+    if !decoded.is_empty() {
+        return decoded;
+    }
+    let Entry::System {
+        event_direction,
+        event_type,
+        event_data,
+        ..
+    } = entry
+    else {
+        return "undecoded OEM record".to_string();
+    };
+    let direction = match event_direction {
+        EventDirection::Assert => "asserted",
+        EventDirection::Deassert => "deasserted",
+    };
+    let kind = match event_type {
+        0x01 => "threshold",
+        0x02..=0x0C => "generic discrete",
+        0x6F => "sensor-specific",
+        0x70..=0x7F => "OEM",
+        _ => "unknown",
+    };
+    let extra = event_data.to_string();
+    if extra.is_empty() {
+        format!(
+            "{direction} {kind} event (type 0x{event_type:02X}, offset 0x{:02X})",
+            event_data.offset
+        )
+    } else {
+        format!(
+            "{direction} {kind} event (type 0x{event_type:02X}, offset 0x{:02X}; {extra})",
+            event_data.offset
+        )
+    }
 }
 
 fn clear(conn: &mut Conn, yes: bool) -> Result<(), String> {
@@ -593,12 +737,11 @@ pub fn health_summary(conn: &mut Conn, recent_limit: usize) -> Result<HealthSumm
         .filter(|entry| entry_severity(entry) == SelSeverity::Critical)
         .take(recent_limit)
         .map(|entry| {
-            let description = entry_description(entry);
-            if description.is_empty() {
-                format!("entry 0x{:04X}", entry_id(entry).value())
-            } else {
-                format!("0x{:04X}: {description}", entry_id(entry).value())
-            }
+            format!(
+                "0x{:04X}: {}",
+                entry_id(entry).value(),
+                display_entry_description(entry)
+            )
         })
         .collect::<Vec<_>>();
     recent_critical.reverse();
@@ -740,6 +883,76 @@ mod tests {
             entry_severity(&system_event(EventDirection::Deassert, 0x01, 2)),
             SelSeverity::Normal
         );
+    }
+
+    #[test]
+    fn selects_only_oem_defined_system_events_for_firmware_decoding() {
+        let standard = system_event(EventDirection::Assert, 0x6F, 0);
+        assert!(!should_decode_oem(&standard));
+
+        let mut oem_sensor = system_event(EventDirection::Assert, 0x6F, 0);
+        let Entry::System { sensor_type, .. } = &mut oem_sensor else {
+            unreachable!();
+        };
+        *sensor_type = 0xE1;
+        assert!(should_decode_oem(&oem_sensor));
+
+        let oem_event = system_event(EventDirection::Assert, 0x7F, 6);
+        assert!(should_decode_oem(&oem_event));
+    }
+
+    #[test]
+    fn uses_fujitsu_firmware_severity_when_available() {
+        let entry = system_event(EventDirection::Assert, 0x7F, 6);
+        let mut decoded = OemDecodedEntries::new();
+        decoded.insert(
+            1,
+            fujitsu::DecodedSelEntry {
+                record_id: 1,
+                record_type: 2,
+                timestamp: 1_700_000_000,
+                severity: fujitsu::Severity::Informational,
+                css: false,
+                text: "BBU relearn required".to_string(),
+            },
+        );
+        assert_eq!(displayed_severity(&entry, &decoded), SelSeverity::Normal);
+    }
+
+    #[test]
+    fn preserves_undecoded_event_context_without_guessing_severity() {
+        let entry = system_event(EventDirection::Assert, 0x6F, 0x0E);
+        assert_eq!(entry_severity(&entry), SelSeverity::Unknown);
+        let description = display_entry_description(&entry);
+        assert!(description.contains("asserted sensor-specific event"));
+        assert!(description.contains("offset 0x0E"));
+    }
+
+    #[test]
+    fn classifies_running_and_oem_crash_text() {
+        assert_eq!(
+            severity_from_description("transition to Running"),
+            Some(SelSeverity::Normal)
+        );
+        assert_eq!(
+            severity_from_description("softlockup: hung tasks"),
+            Some(SelSeverity::Critical)
+        );
+        assert_eq!(severity_from_description("vendor state 42"), None);
+    }
+
+    #[test]
+    fn sensor_names_are_keyed_by_type_and_number() {
+        let mut names = SensorNames::new();
+        names.insert((0x01, 7), "Temperature 7".to_string());
+        names.insert((0x04, 7), "Fan 7".to_string());
+        let entry = system_event(EventDirection::Assert, 0x01, 0);
+        let Entry::System { sensor_number, .. } = &entry else {
+            unreachable!()
+        };
+        assert_eq!(*sensor_number, 1);
+        names.insert((0x01, 1), "CPU Temp".to_string());
+        assert!(entry_sensor(&entry, &names).starts_with("CPU Temp"));
     }
 
     #[test]

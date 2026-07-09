@@ -132,6 +132,28 @@ pub enum Command {
     /// Maintain the BMC itself: reset it or run its self test.
     #[command(alias = "mc")]
     Bmc(BmcArgs),
+
+    /// Send an arbitrary IPMI request for protocol diagnostics.
+    Raw(RawArgs),
+}
+
+#[derive(Args)]
+pub struct RawArgs {
+    /// Network function, in decimal or hexadecimal (for example `0x2e`).
+    #[arg(value_parser = parse_netfn, value_name = "NETFN")]
+    pub netfn: u8,
+
+    /// Command, in decimal or hexadecimal (for example `0xf5`).
+    #[arg(value_parser = parse_byte, value_name = "COMMAND")]
+    pub command: u8,
+
+    /// Request data bytes, in decimal or hexadecimal.
+    #[arg(value_parser = parse_byte, value_name = "DATA")]
+    pub data: Vec<u8>,
+
+    /// Send without the raw-command confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args)]
@@ -194,6 +216,10 @@ pub struct SelArgs {
     #[arg(long)]
     pub raw: bool,
 
+    /// Do not ask supported BMCs for vendor-supplied OEM event text.
+    #[arg(long)]
+    pub no_oem_decode: bool,
+
     /// Only show entries at or after this RFC 3339 or Unix timestamp.
     #[arg(long, value_name = "TIME")]
     pub since: Option<String>,
@@ -224,6 +250,7 @@ pub enum SelSeverity {
     Normal,
     Warning,
     Critical,
+    Unknown,
 }
 
 #[derive(Subcommand)]
@@ -248,6 +275,16 @@ pub enum SelAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Ask a Fujitsu iRMC to translate SEL records using OEM command F5 43.
+    Decode {
+        /// One or more record IDs, in decimal or hexadecimal.
+        #[arg(required = true, value_parser = parse_u16, value_name = "RECORD_ID")]
+        record_ids: Vec<u16>,
+
+        /// Print each OEM request and response frame.
+        #[arg(long)]
+        debug: bool,
+    },
 }
 
 fn parse_u16(value: &str) -> Result<u16, String> {
@@ -260,6 +297,29 @@ fn parse_u16(value: &str) -> Result<u16, String> {
         value
             .parse::<u16>()
             .map_err(|_| format!("invalid record ID '{value}'"))
+    }
+}
+
+fn parse_byte(value: &str) -> Result<u8, String> {
+    let parsed = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u8::from_str_radix(hex, 16)
+    } else {
+        value.parse::<u8>()
+    };
+    parsed.map_err(|_| format!("invalid byte '{value}' (expected 0..255)"))
+}
+
+fn parse_netfn(value: &str) -> Result<u8, String> {
+    let netfn = parse_byte(value)?;
+    if netfn <= 0x3F && netfn % 2 == 0 {
+        Ok(netfn)
+    } else {
+        Err(format!(
+            "invalid request network function '{value}' (expected an even value from 0..0x3e)"
+        ))
     }
 }
 
@@ -573,6 +633,53 @@ mod tests {
                 yes: true
             })
         ));
+    }
+
+    #[test]
+    fn parses_fujitsu_sel_decode_and_raw_diagnostics() {
+        let decode =
+            Cli::try_parse_from(["ipmicfg", "sel", "decode", "0x009E", "0x00A6", "--debug"])
+                .expect("valid Fujitsu SEL decode arguments");
+        assert!(matches!(
+            decode.command,
+            Command::Sel(SelArgs {
+                action: Some(SelAction::Decode {
+                    ref record_ids,
+                    debug: true,
+                }),
+                ..
+            }) if record_ids == &[0x009E, 0x00A6]
+        ));
+
+        let list = Cli::try_parse_from(["ipmicfg", "sel", "--no-oem-decode"])
+            .expect("valid OEM decode opt-out");
+        assert!(matches!(
+            list.command,
+            Command::Sel(SelArgs {
+                no_oem_decode: true,
+                ..
+            })
+        ));
+
+        let raw =
+            Cli::try_parse_from(["ipmicfg", "raw", "0x2e", "0xf5", "0x80", "40", "0", "--yes"])
+                .expect("valid raw diagnostic arguments");
+        assert!(matches!(
+            raw.command,
+            Command::Raw(RawArgs {
+                netfn: 0x2E,
+                command: 0xF5,
+                ref data,
+                yes: true,
+            }) if data == &[0x80, 40, 0]
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_range_raw_values() {
+        assert!(Cli::try_parse_from(["ipmicfg", "raw", "0x40", "0", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["ipmicfg", "raw", "0x2f", "0", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["ipmicfg", "raw", "0", "256", "--yes"]).is_err());
     }
 
     #[test]
