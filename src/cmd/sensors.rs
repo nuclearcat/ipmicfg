@@ -1,5 +1,7 @@
 //! `sensors` — read and display analog and discrete sensor health.
 
+use std::io::IsTerminal;
+
 use ipmi_rs::connection::{Address, Channel, NetFn};
 use ipmi_rs::storage::sdr::event_reading_type_code::EventReadingTypeCodes;
 use ipmi_rs::storage::sdr::record::{
@@ -34,7 +36,27 @@ pub fn run(conn: &mut Conn, args: &SensorsArgs) -> Result<(), String> {
 }
 
 fn render(conn: &mut Conn, args: &SensorsArgs) -> Result<(), String> {
-    let records: Vec<_> = conn.sdrs().collect();
+    let interactive = std::io::stderr().is_terminal();
+    if interactive {
+        eprintln!("Reading SDR repository...");
+    }
+    let records = conn.collect_sdrs()?;
+    let sensor_count = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                &record.contents,
+                RecordContents::FullSensor(_)
+                    | RecordContents::CompactSensor(_)
+                    | RecordContents::EventOnlySensor(_)
+            )
+        })
+        .count();
+    if interactive {
+        eprintln!(
+            "Reading {sensor_count} sensors (individual BMC timeouts may delay completion)..."
+        );
+    }
     let mut analog = Table::new(
         if args.thresholds {
             &["TYPE", "SENSOR", "READING", "STATE", "THRESHOLDS"]
@@ -69,6 +91,25 @@ fn render(conn: &mut Conn, args: &SensorsArgs) -> Result<(), String> {
                     continue;
                 }
 
+                if !is_threshold(full.event_reading_type_codes()) {
+                    add_discrete(
+                        conn,
+                        args,
+                        &mut discrete,
+                        &mut hidden_discrete,
+                        &mut counts,
+                        DiscreteSensor {
+                            ty: *full.ty(),
+                            type_name: ty,
+                            name,
+                            event_code: *full.event_reading_type_codes(),
+                            key: full.key_data(),
+                        },
+                    );
+                    continue;
+                }
+
+                verbose_read(args, &ty, &name, "threshold");
                 let reading = read_analog(conn, full);
                 if let Err(error) = &reading {
                     if args.verbose {
@@ -199,6 +240,7 @@ fn add_discrete(
     counts: &mut Counts,
     sensor: DiscreteSensor<'_>,
 ) {
+    verbose_read(args, &sensor.type_name, &sensor.name, "discrete");
     let reading = read_discrete(conn, &sensor);
     if let Err(error) = &reading {
         if args.verbose {
@@ -266,6 +308,13 @@ fn read_discrete(conn: &mut Conn, sensor: &DiscreteSensor<'_>) -> Result<(Status
         return Ok((Status::Ok, "none (raw 0x0000)".to_string()));
     }
 
+    if has_unknown_semantics(sensor.event_code) {
+        return Ok((
+            Status::Unknown,
+            format!("vendor/unspecified state (raw 0x{raw:04X})"),
+        ));
+    }
+
     let mut descriptions = Vec::new();
     let mut status = Status::Ok;
     for offset in 0..15u8 {
@@ -320,9 +369,33 @@ fn event_code_value(code: EventReadingTypeCodes) -> u8 {
     }
 }
 
+fn is_threshold(code: &EventReadingTypeCodes) -> bool {
+    matches!(code, EventReadingTypeCodes::Threshold)
+}
+
+fn has_unknown_semantics(code: EventReadingTypeCodes) -> bool {
+    matches!(
+        code,
+        EventReadingTypeCodes::Unspecified
+            | EventReadingTypeCodes::Oem(_)
+            | EventReadingTypeCodes::Reserved(_)
+    )
+}
+
 fn discrete_state_status(description: &str) -> Status {
     let value = description.to_ascii_lowercase();
     if [
+        "predictive failure",
+        "warning",
+        "degraded",
+        "not present",
+        "absent",
+    ]
+    .iter()
+    .any(|word| value.contains(word))
+    {
+        Status::Warn
+    } else if [
         "failure",
         "failed",
         "fault",
@@ -339,17 +412,6 @@ fn discrete_state_status(description: &str) -> Status {
     .any(|word| value.contains(word))
     {
         Status::Crit
-    } else if [
-        "warning",
-        "degraded",
-        "predictive",
-        "redundancy",
-        "not present",
-    ]
-    .iter()
-    .any(|word| value.contains(word))
-    {
-        Status::Warn
     } else if [
         "present",
         "enabled",
@@ -448,6 +510,15 @@ fn contains_case_insensitive(value: &str, pattern: &str) -> bool {
         .contains(&pattern.to_ascii_lowercase())
 }
 
+fn verbose_read(args: &SensorsArgs, sensor_type: &str, name: &str, kind: &str) {
+    if args.verbose {
+        eprintln!(
+            "{} reading {kind} sensor {sensor_type} / {name}",
+            ui::dim("debug:")
+        );
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct Counts {
     pub ok: usize,
@@ -472,15 +543,28 @@ impl Counts {
 }
 
 /// Collect health counts without producing terminal output.
-pub fn health_summary(conn: &mut Conn) -> Counts {
-    let records: Vec<_> = conn.sdrs().collect();
+pub fn health_summary(conn: &mut Conn) -> Result<Counts, String> {
+    let records = conn.collect_sdrs()?;
     let mut counts = Counts::default();
     for record in &records {
         match &record.contents {
             RecordContents::FullSensor(full) => {
-                let status = read_analog(conn, full)
-                    .map(|(_, status)| status)
-                    .unwrap_or(Status::Unknown);
+                let status = if is_threshold(full.event_reading_type_codes()) {
+                    read_analog(conn, full)
+                        .map(|(_, status)| status)
+                        .unwrap_or(Status::Unknown)
+                } else {
+                    let item = DiscreteSensor {
+                        ty: *full.ty(),
+                        type_name: String::new(),
+                        name: String::new(),
+                        event_code: *full.event_reading_type_codes(),
+                        key: full.key_data(),
+                    };
+                    read_discrete(conn, &item)
+                        .map(|(status, _)| status)
+                        .unwrap_or(Status::Unknown)
+                };
                 counts.tally(status);
             }
             RecordContents::CompactSensor(sensor) => {
@@ -514,7 +598,7 @@ pub fn health_summary(conn: &mut Conn) -> Counts {
             _ => {}
         }
     }
-    counts
+    Ok(counts)
 }
 
 fn print_counts(counts: Counts) {
@@ -583,7 +667,7 @@ mod tests {
     #[test]
     fn classifies_discrete_descriptions() {
         assert_eq!(discrete_state_status("Power supply failure"), Status::Crit);
-        assert_eq!(discrete_state_status("Predictive failure"), Status::Crit);
+        assert_eq!(discrete_state_status("Predictive failure"), Status::Warn);
         assert_eq!(discrete_state_status("Redundancy degraded"), Status::Warn);
         assert_eq!(discrete_state_status("Device Present"), Status::Ok);
         assert_eq!(discrete_state_status("vendor state"), Status::Warn);
@@ -601,5 +685,13 @@ mod tests {
         assert_eq!(classify_threshold_bits(0b0000_0010), Status::Crit);
         assert_eq!(classify_threshold_bits(0b0000_1000), Status::Warn);
         assert_eq!(classify_threshold_bits(0), Status::Ok);
+    }
+
+    #[test]
+    fn classifies_records_by_event_reading_type() {
+        assert!(is_threshold(&EventReadingTypeCodes::Threshold));
+        assert!(!is_threshold(&EventReadingTypeCodes::SensorSpecific));
+        assert!(!is_threshold(&EventReadingTypeCodes::Oem(0x70)));
+        assert!(has_unknown_semantics(EventReadingTypeCodes::Oem(0x70)));
     }
 }

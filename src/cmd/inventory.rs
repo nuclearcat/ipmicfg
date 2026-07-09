@@ -51,7 +51,7 @@ pub fn run(conn: &mut Conn) -> Result<(), String> {
     }
 
     // Devices discovered in the SDR repository.
-    let records: Vec<_> = conn.sdrs().collect();
+    let records = conn.collect_sdrs()?;
     let mut table = Table::new(&["KIND", "NAME"], &[Align::Left, Align::Left]);
     for record in &records {
         let (kind, name) = match &record.contents {
