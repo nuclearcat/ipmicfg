@@ -47,5 +47,6 @@ fn run(cli: &Cli) -> Result<(), String> {
         Command::Power(args) => cmd::power::run(&mut conn, args),
         Command::Identify(args) => cmd::identify::run(&mut conn, args),
         Command::Bmc(args) => cmd::bmc::run(&mut conn, args),
+        Command::Raw(args) => cmd::raw::run(&mut conn, args),
     }
 }

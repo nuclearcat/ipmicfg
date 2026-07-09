@@ -12,6 +12,7 @@ directly or over the network.
 | Monitoring | `status` | One-screen overview: power, identity, capabilities |
 | Monitoring | `sensors` | Live sensor readings with OK/WARN/CRIT coloring |
 | Monitoring | `sel` | Read, summarize and clear the System Event Log |
+| Diagnostics | `raw` | Send a guarded raw IPMI request and inspect its response |
 | Inventory | `inventory` (alias `fru`) | BMC identity, all logical FRUs, raw export, detected devices |
 | Configuration | `lan show` / `lan set` | View / change the BMC network configuration |
 | Configuration | `boot` | Inspect or set one-shot/persistent boot overrides |
@@ -70,8 +71,13 @@ ipmicfg sel                        # list
 ipmicfg sel info                   # summary
 ipmicfg sel --since 2026-07-01T00:00:00Z --severity critical --limit 20
 ipmicfg sel --sensor PSU --follow
+ipmicfg sel --no-oem-decode          # skip vendor queries and use local decoding only
 ipmicfg sel delete 0x003A          # delete one entry when supported
 ipmicfg sel clear                  # erase (asks for confirmation; --yes to skip)
+
+# Ask Fujitsu iRMC firmware to translate its own OEM SEL records (F5 43)
+ipmicfg sel decode 0x009E 0x00A5 0x00A6 0x00A7
+ipmicfg sel decode 0x00A6 --debug  # also print each request/response frame
 
 # Inventory (all logical FRUs + discovered devices)
 ipmicfg inventory
@@ -101,11 +107,16 @@ ipmicfg power on
 ipmicfg power off                  # confirms first
 ipmicfg power cycle
 ipmicfg power soft                 # graceful ACPI shutdown
+
+# Guarded low-level diagnostics (hexadecimal and decimal bytes are accepted)
+ipmicfg raw 0x2e 0xf5 0x80 0x28 0x00 0x43 0xa6 0x00 0x00 0x38 --yes
 ```
 
 Destructive or lockout-prone operations (`power off/cycle/reset/diag`, `sel
 clear`, `lan set`, persistent boot overrides, and user mutations) prompt for
 confirmation. Supported actions accept `--yes` for deliberate automation.
+The generic `raw` interface always confirms unless `--yes` is supplied because
+an arbitrary vendor command may change controller or host state.
 
 ## Notes & limitations
 
@@ -126,6 +137,14 @@ confirmation. Supported actions accept `--yes` for deliberate automation.
 - Sensor scans print progress on an interactive terminal. `--verbose` identifies
   each request, and `--timeout-ms` can shorten delays caused by unsupported or
   unresponsive sensors.
+- On detected Fujitsu controllers, normal `sel` output uses iRMC OEM command F5
+  43 by default for vendor-defined sensor and event types. `--no-oem-decode`
+  disables the additional requests and restores the generic local rendering.
+- `sel decode` exposes the same Fujitsu command for explicit record inspection,
+  including
+  bounded response parsing, long-text pagination, vendor severity, and the CSS
+  (customer-replaceable component) flag. It does not require `ipmitool` or
+  FreeIPMI.
 
 ## License
 

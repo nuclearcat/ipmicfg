@@ -54,6 +54,9 @@ automate, and more complete for day-to-day server management.
   - [x] Support `--since`, `--until`, `--sensor`, `--severity`, and `--limit`.
   - [x] Consider `--follow` where the BMC and transport make polling practical.
   - [x] Add optional deletion of an individual SEL entry when supported.
+  - [x] Decode Fujitsu iRMC OEM records through the controller's F5 43 long-text
+    interface by default, with a local-decoding opt-out and optional
+    request/response diagnostics.
   - Preserve raw fields in JSON output, including OEM data.
 
 - [x] Expand `status` into a health summary.
@@ -93,11 +96,12 @@ automate, and more complete for day-to-day server management.
 
 ## P2 — Advanced operations
 
-- [ ] Add a guarded raw IPMI command interface:
+- [x] Add a guarded raw IPMI command interface:
   `raw <netfn> <command> [DATA...]`.
-  - Parse hexadecimal and decimal bytes consistently.
-  - Print completion codes and response bytes.
-  - Require explicit confirmation for known destructive commands where feasible.
+  - [x] Parse hexadecimal and decimal bytes consistently.
+  - [x] Print completion codes, response bytes, and an ASCII view.
+  - [x] Require confirmation for every arbitrary request unless `--yes` is
+    supplied, because unknown OEM commands cannot be classified safely.
 
 - [ ] Add Serial over LAN support if `ipmi-rs` exposes the required session and
   payload APIs.
