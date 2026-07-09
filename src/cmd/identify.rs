@@ -38,10 +38,7 @@ pub fn run(conn: &mut Conn, args: &IdentifyArgs) -> Result<(), String> {
                 }
                 cc => {
                     check(cc)?;
-                    println!(
-                        "{} identify LED on until `identify off`",
-                        ui::green("OK:")
-                    );
+                    println!("{} identify LED on until `identify off`", ui::green("OK:"));
                 }
             }
         }
@@ -58,7 +55,9 @@ fn send(conn: &mut Conn, data: Vec<u8>) -> Result<u8, String> {
 
 fn check(cc: u8) -> Result<(), String> {
     if cc != 0 {
-        return Err(format!("Chassis Identify rejected: completion code 0x{cc:02X}"));
+        return Err(format!(
+            "Chassis Identify rejected: completion code 0x{cc:02X}"
+        ));
     }
     Ok(())
 }

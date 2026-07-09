@@ -79,10 +79,17 @@ pub fn read(conn: &mut Conn, fru_id: u8) -> Result<Fru, String> {
 /// Get the size of a FRU inventory area, in bytes.
 fn area_size(conn: &mut Conn, fru_id: u8) -> Result<usize, String> {
     let resp = conn
-        .send_raw(NetFn::from(NETFN_STORAGE), CMD_GET_FRU_AREA_INFO, vec![fru_id])
+        .send_raw(
+            NetFn::from(NETFN_STORAGE),
+            CMD_GET_FRU_AREA_INFO,
+            vec![fru_id],
+        )
         .map_err(|e| format!("Get FRU Area Info failed: {e}"))?;
     if resp.cc() != 0 {
-        return Err(format!("Get FRU Area Info: completion code 0x{:02X}", resp.cc()));
+        return Err(format!(
+            "Get FRU Area Info: completion code 0x{:02X}",
+            resp.cc()
+        ));
     }
     let data = resp.data();
     if data.len() < 2 {

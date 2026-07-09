@@ -38,7 +38,10 @@ fn reset(conn: &mut Conn, warm: bool, yes: bool) -> Result<(), String> {
 
     match conn.send_raw(NetFn::App, cmd, vec![]) {
         Ok(resp) if resp.cc() == 0 => {
-            println!("{} {kind} reset issued; BMC is restarting", ui::green("OK:"));
+            println!(
+                "{} {kind} reset issued; BMC is restarting",
+                ui::green("OK:")
+            );
             Ok(())
         }
         Ok(resp) => Err(format!(

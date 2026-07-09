@@ -8,8 +8,8 @@
 use std::time::Duration;
 
 use ipmi_rs::connection::{
-    IpmiCommand, IpmiConnection, LogicalUnit, Message, NetFn, Request, RequestTargetAddress,
-    Response,
+    Address, Channel, IpmiCommand, IpmiConnection, LogicalUnit, Message, NetFn, Request,
+    RequestTargetAddress, Response,
 };
 use ipmi_rs::rmcp::{
     Rmcp, RmcpIpmiError, RmcpIpmiReceiveError, RmcpIpmiSendError, V1_5WriteError, V2_0WriteError,
@@ -120,8 +120,41 @@ impl Conn {
     /// Used for commands not yet modelled by ipmi-rs, such as Chassis Control
     /// and the FRU read commands.
     pub fn send_raw(&mut self, netfn: NetFn, cmd: u8, data: Vec<u8>) -> std::io::Result<Response> {
+        self.send_raw_target(
+            netfn,
+            cmd,
+            data,
+            RequestTargetAddress::Bmc(LogicalUnit::Zero),
+        )
+    }
+
+    /// Send a raw request to a specific BMC or IPMB target.
+    pub fn send_raw_to(
+        &mut self,
+        netfn: NetFn,
+        cmd: u8,
+        data: Vec<u8>,
+        address: Address,
+        channel: Channel,
+        lun: LogicalUnit,
+    ) -> std::io::Result<Response> {
+        self.send_raw_target(
+            netfn,
+            cmd,
+            data,
+            RequestTargetAddress::BmcOrIpmb(address, channel, lun),
+        )
+    }
+
+    fn send_raw_target(
+        &mut self,
+        netfn: NetFn,
+        cmd: u8,
+        data: Vec<u8>,
+        target: RequestTargetAddress,
+    ) -> std::io::Result<Response> {
         let message = Message::new_request(netfn, cmd, data);
-        let mut request = Request::new(message, RequestTargetAddress::Bmc(LogicalUnit::Zero));
+        let mut request = Request::new(message, target);
         match self {
             Conn::File(ipmi) => ipmi.inner_mut().send_recv(&mut request),
             Conn::Rmcp(ipmi) => ipmi.inner_mut().send_recv(&mut request).map_err(map_rmcp),
