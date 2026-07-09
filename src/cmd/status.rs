@@ -101,22 +101,25 @@ pub fn run(conn: &mut Conn) -> Result<(), String> {
     }
 
     ui::header("Monitoring Health");
-    let sensors = crate::cmd::sensors::health_summary(conn);
-    if sensors.total() == 0 {
-        ui::kv("Sensors", &ui::dim("none reported or unavailable"), 22);
-    } else {
-        let rendered = format!(
-            "{} OK, {} WARN, {} CRIT, {} unknown",
-            sensors.ok, sensors.warn, sensors.crit, sensors.unknown
-        );
-        let rendered = if sensors.crit > 0 {
-            ui::red(&rendered)
-        } else if sensors.warn > 0 {
-            ui::yellow(&rendered)
-        } else {
-            ui::green(&rendered)
-        };
-        ui::kv("Sensors", &rendered, 22);
+    match crate::cmd::sensors::health_summary(conn) {
+        Ok(sensors) if sensors.total() == 0 => {
+            ui::kv("Sensors", &ui::dim("none reported"), 22);
+        }
+        Ok(sensors) => {
+            let rendered = format!(
+                "{} OK, {} WARN, {} CRIT, {} unknown",
+                sensors.ok, sensors.warn, sensors.crit, sensors.unknown
+            );
+            let rendered = if sensors.crit > 0 {
+                ui::red(&rendered)
+            } else if sensors.warn > 0 {
+                ui::yellow(&rendered)
+            } else {
+                ui::green(&rendered)
+            };
+            ui::kv("Sensors", &rendered, 22);
+        }
+        Err(error) => ui::kv("Sensors", &ui::dim(&format!("unavailable ({error})")), 22),
     }
 
     match crate::cmd::sel::health_summary(conn, 3) {

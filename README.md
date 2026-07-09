@@ -96,8 +96,14 @@ prompt for confirmation; pass `--yes` (or answer `y`) to proceed in scripts.
   `ipmi-rs` does not yet model them as typed commands.
 - `lan set` writes IPv4 parameters (address source, IP, netmask, gateway). MAC and
   IPv6 are read-only here by design.
-- Sensor health is derived from IPMI threshold status bits; sensors without
-  configured thresholds are shown with a neutral state.
+- Threshold-sensor health is derived from IPMI threshold status bits. Discrete
+  sensors are classified from their SDR event-reading type and decoded asserted
+  states. Asserted OEM/vendor-specific states with unknown semantics are shown
+  as neutral rather than guessed to be failures; their raw state mask remains
+  visible with `sensors --all`.
+- Sensor scans print progress on an interactive terminal. `--verbose` identifies
+  each request, and `--timeout-ms` can shorten delays caused by unsupported or
+  unresponsive sensors.
 
 ## License
 

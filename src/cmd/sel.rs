@@ -53,7 +53,7 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
         return Err("--since must not be later than --until".to_string());
     }
 
-    let names = sensor_names(conn);
+    let names = sensor_names(conn)?;
     let info = conn
         .send_recv(GetSelInfo)
         .map_err(|e| format!("Get SEL Info failed: {e:?}"))?;
@@ -204,8 +204,10 @@ fn print_entries(
     println!();
 }
 
-fn sensor_names(conn: &mut Conn) -> HashMap<u8, String> {
-    conn.sdrs()
+fn sensor_names(conn: &mut Conn) -> Result<HashMap<u8, String>, String> {
+    Ok(conn
+        .collect_sdrs()?
+        .iter()
         .filter_map(|record| match &record.contents {
             RecordContents::FullSensor(sensor) => Some((
                 sensor.key_data().sensor_number.get(),
@@ -220,7 +222,7 @@ fn sensor_names(conn: &mut Conn) -> HashMap<u8, String> {
             }
             _ => None,
         })
-        .collect()
+        .collect())
 }
 
 fn matches_entry(

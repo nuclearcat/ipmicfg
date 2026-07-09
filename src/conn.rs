@@ -5,6 +5,7 @@
 //! `send_raw` method so we can issue commands (e.g. Chassis Control) that the
 //! library does not yet model as typed `IpmiCommand`s.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use ipmi_rs::connection::{
@@ -113,6 +114,26 @@ impl Conn {
             Conn::File(ipmi) => SdrIterInner::File(ipmi.sdrs()),
             Conn::Rmcp(ipmi) => SdrIterInner::Rmcp(ipmi.sdrs()),
         }
+    }
+
+    /// Collect the SDR repository while rejecting repeated record IDs.
+    ///
+    /// The upstream iterator stops on an immediately repeated ID, but some
+    /// broken BMCs return longer cycles (for example A -> B -> A). Detecting
+    /// every repeated ID prevents those repositories from looping forever.
+    pub fn collect_sdrs(&mut self) -> Result<Vec<sdr::Record>, String> {
+        let mut records = Vec::new();
+        let mut seen = HashSet::new();
+        for record in self.sdrs() {
+            let id = record.header.id.value();
+            if !seen.insert(id) {
+                return Err(format!(
+                    "SDR repository cycle detected at record 0x{id:04X}"
+                ));
+            }
+            records.push(record);
+        }
+        Ok(records)
     }
 
     /// Send a raw request to the BMC (LUN 0) and return the raw response.
