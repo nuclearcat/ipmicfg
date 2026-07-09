@@ -12,6 +12,7 @@ categories = ["command-line-utilities"]
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 ipmi-rs = { git = "https://github.com/datdenkikniet/ipmi-rs.git" }
+rpassword = "7.5"
 time = { version = "0.3", features = ["parsing"] }
 
 [profile.release]

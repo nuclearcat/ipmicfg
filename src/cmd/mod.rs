@@ -1,6 +1,7 @@
 //! Subcommand implementations.
 
 pub mod bmc;
+pub mod boot;
 pub mod identify;
 pub mod inventory;
 pub mod lan;
@@ -8,6 +9,7 @@ pub mod power;
 pub mod sel;
 pub mod sensors;
 pub mod status;
+pub mod user;
 
 use ipmi_rs::connection::NetFn;
 

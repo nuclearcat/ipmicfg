@@ -63,33 +63,33 @@ automate, and more complete for day-to-day server management.
 
 ## P1 — Inventory and configuration
 
-- [ ] Read every FRU device discovered through SDR records, not only FRU ID 0.
-  - Display each device's locator, ID, product, board, and chassis data.
-  - Add `inventory --fru-id <ID>`.
-  - Add raw FRU image export for troubleshooting and backup.
+- [x] Read every logical FRU device discovered through SDR records, not only FRU ID 0.
+  - [x] Display each device's locator, ID, product, board, and chassis data.
+  - [x] Add `inventory --fru-id <ID>`.
+  - [x] Add raw FRU image export for troubleshooting and backup.
 
-- [ ] Add boot-device override commands.
-  - Support one-shot PXE, disk, optical media, and BIOS/setup boot.
-  - Support clearing an override.
-  - Clearly distinguish one-shot and persistent settings.
-  - Show the currently configured boot flags.
+- [x] Add boot-device override commands.
+  - [x] Support one-shot PXE, disk, optical media, and BIOS/setup boot.
+  - [x] Support clearing an override.
+  - [x] Clearly distinguish one-shot and persistent settings.
+  - [x] Show the currently configured boot flags.
 
-- [ ] Complete LAN configuration support.
-  - Add `lan show --channel <N>` instead of always probing every channel.
-  - Display and configure VLAN ID and priority.
-  - Display and configure gateway MAC where supported.
-  - Display IPv6 information; configuration can follow once transport support is
+- [x] Complete LAN configuration support.
+  - [x] Add `lan show --channel <N>` instead of always probing every channel.
+  - [x] Display and configure VLAN ID and priority.
+  - [x] Display and configure gateway MAC where supported.
+  - [x] Display IPv6 information; configuration can follow once transport support is
     reliable.
-  - Verify values after writes and report mismatches.
-  - Improve transaction cleanup when a write fails after setting "Set In
+  - [x] Verify values after writes and report mismatches.
+  - [x] Improve transaction cleanup when a write fails after setting "Set In
     Progress".
 
-- [ ] Add BMC user management.
-  - List users and channel access.
-  - Enable or disable an account.
-  - Set privilege levels.
-  - Set or rotate passwords without exposing them on the command line.
-  - Require confirmation for lockout-prone changes.
+- [x] Add BMC user management.
+  - [x] List users and channel access.
+  - [x] Enable or disable an account.
+  - [x] Set privilege levels.
+  - [x] Set or rotate passwords without exposing them on the command line.
+  - [x] Require confirmation for lockout-prone changes.
 
 ## P2 — Advanced operations
 

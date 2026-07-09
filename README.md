@@ -12,8 +12,10 @@ directly or over the network.
 | Monitoring | `status` | One-screen overview: power, identity, capabilities |
 | Monitoring | `sensors` | Live sensor readings with OK/WARN/CRIT coloring |
 | Monitoring | `sel` | Read, summarize and clear the System Event Log |
-| Inventory | `inventory` (alias `fru`) | BMC identity, decoded FRU data, detected devices |
+| Inventory | `inventory` (alias `fru`) | BMC identity, all logical FRUs, raw export, detected devices |
 | Configuration | `lan show` / `lan set` | View / change the BMC network configuration |
+| Configuration | `boot` | Inspect or set one-shot/persistent boot overrides |
+| Configuration | `user` | List users and administer names, access and passwords |
 | Configuration | `power` | Query and control chassis power |
 
 Output is colored when writing to a terminal; it auto-disables for pipes, when
@@ -71,13 +73,27 @@ ipmicfg sel --sensor PSU --follow
 ipmicfg sel delete 0x003A          # delete one entry when supported
 ipmicfg sel clear                  # erase (asks for confirmation; --yes to skip)
 
-# Inventory (FRU + discovered devices)
+# Inventory (all logical FRUs + discovered devices)
 ipmicfg inventory
+ipmicfg inventory --fru-id 0 --raw primary-fru.bin
 
 # Network configuration
 ipmicfg lan show
+ipmicfg lan show --channel 1
 ipmicfg lan set --channel 1 --source static \
     --ip 10.0.0.5 --netmask 255.255.255.0 --gateway 10.0.0.1
+ipmicfg lan set --channel 1 --vlan-id 100 --vlan-priority 3
+
+# Boot override
+ipmicfg boot
+ipmicfg boot set pxe                 # one boot
+ipmicfg boot set disk --persistent   # confirms first
+ipmicfg boot clear
+
+# BMC users (mutations confirm first)
+ipmicfg user list --channel 1
+ipmicfg user privilege 3 administrator --channel 1
+ipmicfg user password 3              # hidden prompt; no password in argv
 
 # Power control (destructive actions confirm first; --... no, use the action's confirm)
 ipmicfg power                      # show power state
@@ -87,15 +103,21 @@ ipmicfg power cycle
 ipmicfg power soft                 # graceful ACPI shutdown
 ```
 
-Destructive operations (`power off/cycle/reset/diag`, `sel clear`, `lan set`)
-prompt for confirmation; pass `--yes` (or answer `y`) to proceed in scripts.
+Destructive or lockout-prone operations (`power off/cycle/reset/diag`, `sel
+clear`, `lan set`, persistent boot overrides, and user mutations) prompt for
+confirmation. Supported actions accept `--yes` for deliberate automation.
 
 ## Notes & limitations
 
 - Chassis power control and FRU reads are issued as raw IPMI commands, since
   `ipmi-rs` does not yet model them as typed commands.
-- `lan set` writes IPv4 parameters (address source, IP, netmask, gateway). MAC and
-  IPv6 are read-only here by design.
+- `lan show` reports IPv4, VLAN, gateway MAC and supported IPv6 addresses.
+  `lan set` configures IPv4, gateway MAC and VLAN parameters; IPv6 remains
+  display-only.
+- User passwords are prompted without echo or read from `--password-file` and
+  are limited to the broadly compatible 16-byte IPMI password form.
+- Logical FRUs are decoded through Get FRU Inventory commands. Physical I2C FRU
+  locators are listed, but direct EEPROM access is not attempted.
 - Threshold-sensor health is derived from IPMI threshold status bits. Discrete
   sensors are classified from their SDR event-reading type and decoded asserted
   states. Asserted OEM/vendor-specific states with unknown semantics are shown

@@ -4,7 +4,7 @@
 //! (0x10) and "Read FRU Data" (0x11) commands, then decoded according to the
 //! "Platform Management FRU Information Storage Definition".
 
-use ipmi_rs::connection::NetFn;
+use ipmi_rs::connection::{Address, Channel, LogicalUnit, NetFn, Response};
 
 use crate::conn::Conn;
 
@@ -46,6 +46,13 @@ pub struct ProductInfo {
     pub asset_tag: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub struct FruTarget {
+    pub address: Address,
+    pub channel: Channel,
+    pub lun: LogicalUnit,
+}
+
 impl Fru {
     /// True if no usable string fields were decoded.
     pub fn is_empty(&self) -> bool {
@@ -66,24 +73,73 @@ impl Fru {
     }
 }
 
-/// Read and parse the FRU at the given device id (0 is the primary FRU).
-pub fn read(conn: &mut Conn, fru_id: u8) -> Result<Fru, String> {
-    let size = area_size(conn, fru_id)?;
+pub fn read_raw_at(
+    conn: &mut Conn,
+    fru_id: u8,
+    target: Option<FruTarget>,
+) -> Result<Vec<u8>, String> {
+    let (size, access_unit) = area_size(conn, fru_id, target)?;
     if size == 0 {
         return Err("FRU area reports zero size".to_string());
     }
-    let raw = read_all(conn, fru_id, size)?;
-    Ok(parse(&raw))
+    read_range(conn, fru_id, 0, size, access_unit, target)
+}
+
+/// Read only the standard FRU areas referenced by the common header.
+///
+/// Vendor FRUs can expose very large raw address spaces while keeping their
+/// standard product/board/chassis data in a few short areas. Inventory display
+/// should not download the unused space; raw export deliberately still does.
+pub fn read_decoded_at(
+    conn: &mut Conn,
+    fru_id: u8,
+    target: Option<FruTarget>,
+) -> Result<Fru, String> {
+    let (size, access_unit) = area_size(conn, fru_id, target)?;
+    if size < 8 {
+        return Err(format!("FRU area is too small ({size} bytes)"));
+    }
+    let header = read_range(conn, fru_id, 0, 8, access_unit, target)?;
+    if header.len() < 8 || header[0] != 0x01 {
+        return Ok(Fru::default());
+    }
+
+    let mut image = vec![0u8; size];
+    image[..8].copy_from_slice(&header[..8]);
+    for offset in standard_area_offsets(&header, size) {
+        let prefix = read_range(conn, fru_id, offset, 2, access_unit, target)?;
+        if prefix.len() < 2 {
+            continue;
+        }
+        let length = prefix[1] as usize * 8;
+        if length < 8 || offset + length > size {
+            continue;
+        }
+        let area = read_range(conn, fru_id, offset, length, access_unit, target)?;
+        let end = offset + area.len().min(length);
+        image[offset..end].copy_from_slice(&area[..end - offset]);
+    }
+    Ok(parse_image(&image))
+}
+
+fn standard_area_offsets(header: &[u8], size: usize) -> Vec<usize> {
+    if header.len() < 8 || header[0] != 0x01 {
+        return Vec::new();
+    }
+    [2usize, 3, 4]
+        .into_iter()
+        .map(|index| header[index] as usize * 8)
+        .filter(|offset| *offset != 0 && offset.saturating_add(2) <= size)
+        .collect()
 }
 
 /// Get the size of a FRU inventory area, in bytes.
-fn area_size(conn: &mut Conn, fru_id: u8) -> Result<usize, String> {
-    let resp = conn
-        .send_raw(
-            NetFn::from(NETFN_STORAGE),
-            CMD_GET_FRU_AREA_INFO,
-            vec![fru_id],
-        )
+fn area_size(
+    conn: &mut Conn,
+    fru_id: u8,
+    target: Option<FruTarget>,
+) -> Result<(usize, usize), String> {
+    let resp = send(conn, target, CMD_GET_FRU_AREA_INFO, vec![fru_id])
         .map_err(|e| format!("Get FRU Area Info failed: {e}"))?;
     if resp.cc() != 0 {
         return Err(format!(
@@ -95,21 +151,35 @@ fn area_size(conn: &mut Conn, fru_id: u8) -> Result<usize, String> {
     if data.len() < 2 {
         return Err("Get FRU Area Info: short response".to_string());
     }
-    Ok(u16::from_le_bytes([data[0], data[1]]) as usize)
+    let units = if data.get(2).is_some_and(|value| value & 0x01 != 0) {
+        2
+    } else {
+        1
+    };
+    Ok((u16::from_le_bytes([data[0], data[1]]) as usize, units))
 }
 
-/// Read the whole FRU area in chunks.
-fn read_all(conn: &mut Conn, fru_id: u8, size: usize) -> Result<Vec<u8>, String> {
+/// Read a byte range from a FRU area in bounded chunks.
+fn read_range(
+    conn: &mut Conn,
+    fru_id: u8,
+    start: usize,
+    length: usize,
+    access_unit: usize,
+    target: Option<FruTarget>,
+) -> Result<Vec<u8>, String> {
+    // Keep reads within conservative IPMB response-size limits. Sparse reads,
+    // rather than a larger chunk, provide the significant latency reduction.
     const CHUNK: usize = 16;
-    let mut out = Vec::with_capacity(size);
-    let mut offset = 0usize;
+    let mut out = Vec::with_capacity(length);
+    let mut offset = start;
+    let end = start.saturating_add(length);
 
-    while offset < size {
-        let want = CHUNK.min(size - offset) as u8;
-        let off = offset as u16;
+    while offset < end {
+        let want = CHUNK.min(end - offset) as u8;
+        let off = (offset / access_unit) as u16;
         let req = vec![fru_id, (off & 0xFF) as u8, (off >> 8) as u8, want];
-        let resp = conn
-            .send_raw(NetFn::from(NETFN_STORAGE), CMD_READ_FRU_DATA, req)
+        let resp = send(conn, target, CMD_READ_FRU_DATA, req)
             .map_err(|e| format!("Read FRU Data failed at offset {offset}: {e}"))?;
         if resp.cc() != 0 {
             return Err(format!(
@@ -134,8 +204,27 @@ fn read_all(conn: &mut Conn, fru_id: u8, size: usize) -> Result<Vec<u8>, String>
     Ok(out)
 }
 
+fn send(
+    conn: &mut Conn,
+    target: Option<FruTarget>,
+    command: u8,
+    data: Vec<u8>,
+) -> std::io::Result<Response> {
+    match target {
+        Some(target) => conn.send_raw_to(
+            NetFn::from(NETFN_STORAGE),
+            command,
+            data,
+            target.address,
+            target.channel,
+            target.lun,
+        ),
+        None => conn.send_raw(NetFn::from(NETFN_STORAGE), command, data),
+    }
+}
+
 /// Parse a complete FRU image into structured fields.
-fn parse(data: &[u8]) -> Fru {
+pub fn parse_image(data: &[u8]) -> Fru {
     let mut fru = Fru::default();
     if data.len() < 8 || data[0] != 0x01 {
         return fru;
@@ -348,4 +437,17 @@ fn chassis_type_name(code: u8) -> Option<&'static str> {
         0x1D => "Blade Enclosure",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_only_referenced_standard_areas() {
+        let header = [0x01, 0, 1, 3, 5, 0, 0, 0];
+        assert_eq!(standard_area_offsets(&header, 128), [8, 24, 40]);
+        assert!(standard_area_offsets(&[0; 8], 128).is_empty());
+        assert_eq!(standard_area_offsets(&header, 25), [8]);
+    }
 }
