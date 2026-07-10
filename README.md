@@ -26,10 +26,26 @@ Output is colored when writing to a terminal; it auto-disables for pipes, when
 
 ## Install
 
+Release packages are built for 64-bit Ubuntu 26.04 LTS and Fedora 44. Download
+the `.deb` or `.rpm` from the matching
+[GitHub release](https://github.com/nuclearcat/ipmicfg/releases), then install it:
+
+```sh
+# Ubuntu
+sudo apt install ./ipmicfg_*_amd64.deb
+
+# Fedora
+sudo dnf install ./ipmicfg-*.x86_64.rpm
+```
+
+To build from source instead:
+
 ```sh
 cargo build --release
 # binary at ./target/release/ipmicfg
 ```
+
+Maintainers should follow [RELEASING.md](RELEASING.md) to publish a release.
 
 ## Connecting
 
@@ -109,7 +125,7 @@ ipmicfg user list --channel 1
 ipmicfg user privilege 3 administrator --channel 1
 ipmicfg user password 3              # hidden prompt; no password in argv
 
-# Power control (destructive actions confirm first; --... no, use the action's confirm)
+# Power control (destructive actions confirm first)
 ipmicfg power                      # show power state
 ipmicfg power on
 ipmicfg power off                  # confirms first

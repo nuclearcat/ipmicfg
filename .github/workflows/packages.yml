@@ -1,0 +1,109 @@
+name: Packages
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/packages.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "README.md"
+      - "src/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/packages.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "README.md"
+      - "src/**"
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    name: Ubuntu 26.04 .deb (x86_64)
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates curl pkg-config xz-utils
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
+            https://sh.rustup.rs | sh -s -- --profile minimal --default-toolchain stable -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build Debian package
+        run: |
+          cargo install --locked cargo-deb --version 3.7.0
+          cargo deb
+
+      - name: Inspect Debian package
+        run: |
+          dpkg-deb --info target/debian/*.deb
+          dpkg-deb --contents target/debian/*.deb
+          mkdir package-root
+          dpkg-deb --extract target/debian/*.deb package-root
+          package-root/usr/bin/ipmicfg --version
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipmicfg-deb-ubuntu-26.04
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  rpm:
+    name: Fedora 44 .rpm (x86_64)
+    runs-on: ubuntu-24.04
+    container: fedora:44
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install --assumeyes \
+            binutils ca-certificates curl gcc make pkgconf-pkg-config rpm-build
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
+            https://sh.rustup.rs | sh -s -- --profile minimal --default-toolchain stable -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build RPM package
+        run: |
+          cargo install --locked cargo-generate-rpm --version 0.21.0
+          cargo build --release --locked
+          strip target/release/ipmicfg
+          cargo generate-rpm
+
+      - name: Inspect RPM package
+        run: |
+          rpm --query --package --info target/generate-rpm/*.rpm
+          rpm --query --package --list target/generate-rpm/*.rpm
+          rpm --query --package --requires target/generate-rpm/*.rpm
+
+      - name: Upload RPM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipmicfg-rpm-fedora-44
+          path: target/generate-rpm/*.rpm
+          if-no-files-found: error
