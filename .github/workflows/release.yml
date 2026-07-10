@@ -13,6 +13,7 @@ jobs:
     name: Validate release tag
     runs-on: ubuntu-24.04
     outputs:
+      published: ${{ steps.version.outputs.published }}
       version: ${{ steps.version.outputs.version }}
 
     steps:
@@ -20,6 +21,8 @@ jobs:
 
       - name: Match tag to Cargo version
         id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
@@ -27,16 +30,29 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
             exit 1
           fi
+
+          published=false
+          if gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --silent >/dev/null 2>&1; then
+            published=true
+            echo "Release $GITHUB_REF_NAME is already published; nothing to rebuild." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "published=$published" >> "$GITHUB_OUTPUT"
 
   packages:
     name: Build packages
     needs: validate
+    if: needs.validate.outputs.published != 'true'
     uses: ./.github/workflows/packages.yml
 
   publish:
     name: Publish GitHub release
     needs: [validate, packages]
+    if: needs.validate.outputs.published != 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write

@@ -17,14 +17,95 @@ on:
       - "README.md"
       - "src/**"
   workflow_call:
+    inputs:
+      force_build:
+        description: Build even when this version is already published
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build even when this version is already published
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: Check package version
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.decision.outputs.build }}
+      version: ${{ steps.decision.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether packages are needed
+        id: decision
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "$version" ]]; then
+            echo "Could not read the package version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          version_changed=true
+          if [[ "$GITHUB_EVENT_NAME" == "push" \
+                && -n "$BEFORE_SHA" \
+                && "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            previous_version="$(
+              git show "${BEFORE_SHA}:Cargo.toml" 2>/dev/null \
+                | sed -n 's/^version = "\([^"]*\)"/\1/p' \
+                | head -n 1
+            )"
+            if [[ "$previous_version" == "$version" ]]; then
+              version_changed=false
+            fi
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            version_changed=false
+          fi
+
+          published=false
+          if gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/v$version" \
+            --silent >/dev/null 2>&1; then
+            published=true
+          fi
+
+          build=true
+          reason="package validation is required"
+          if [[ "$FORCE_BUILD" == "true" ]]; then
+            reason="a forced build was requested"
+          elif [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            reason="pull requests always validate packaging"
+          elif [[ "$version_changed" == "false" && "$published" == "true" ]]; then
+            build=false
+            reason="v$version is unchanged and already published"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Package version: $version" >> "$GITHUB_STEP_SUMMARY"
+          echo "Version changed: $version_changed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Already published: $published" >> "$GITHUB_STEP_SUMMARY"
+          echo "Decision: $reason" >> "$GITHUB_STEP_SUMMARY"
+
   deb:
     name: Ubuntu 26.04 .deb (x86_64)
+    needs: preflight
+    if: needs.preflight.outputs.build == 'true'
     runs-on: ubuntu-24.04
     container: ubuntu:26.04
 
@@ -68,6 +149,8 @@ jobs:
 
   rpm:
     name: Fedora 44 .rpm (x86_64)
+    needs: preflight
+    if: needs.preflight.outputs.build == 'true'
     runs-on: ubuntu-24.04
     container: fedora:44
 
