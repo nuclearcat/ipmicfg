@@ -134,6 +134,11 @@ an arbitrary vendor command may change controller or host state.
   states. Asserted OEM/vendor-specific states with unknown semantics are shown
   as neutral rather than guessed to be failures; their raw state mask remains
   visible with `sensors --all`.
+- SEL System Firmware Progress records use the standard IPMI extension table to
+  report checkpoints such as memory initialization and starting the operating
+  system boot process. Progress checkpoints and ordinary power-off/down state
+  transitions are informational rather than warnings; deasserted power events
+  are shown as cleared conditions.
 - Sensor scans print progress on an interactive terminal. `--verbose` identifies
   each request, and `--timeout-ms` can shorten delays caused by unsupported or
   unresponsive sensors.
@@ -145,6 +150,9 @@ an arbitrary vendor command may change controller or host state.
   bounded response parsing, long-text pagination, vendor severity, and the CSS
   (customer-replaceable component) flag. It does not require `ipmitool` or
   FreeIPMI.
+- Dell OEM diagnostic companion records are identified separately from Link
+  Tuning events, shown as informational service context, and retain their raw
+  diagnostic bytes in the description.
 
 ## License
 
