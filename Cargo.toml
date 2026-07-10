@@ -5,9 +5,26 @@ edition = "2021"
 authors = ["nuclearcat <nuclearcat@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "An intuitive IPMI/BMC tool for initial configuration, monitoring and inventory, built on ipmi-rs"
-repository = "https://github.com/datdenkikniet/ipmi-rs"
+repository = "https://github.com/nuclearcat/ipmicfg"
+readme = "README.md"
 keywords = ["ipmi", "bmc", "sysadmin", "monitoring"]
 categories = ["command-line-utilities"]
+
+[package.metadata.deb]
+section = "admin"
+priority = "optional"
+extended-description = "Command-line management of local and remote IPMI/BMC controllers, including monitoring, inventory, network configuration, boot overrides, user administration, and chassis power control."
+assets = [
+    ["target/release/ipmicfg", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/ipmicfg/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+release = "1"
+assets = [
+    { source = "target/release/ipmicfg", dest = "/usr/bin/ipmicfg", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/ipmicfg/README.md", mode = "644", doc = true },
+]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
