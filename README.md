@@ -18,6 +18,8 @@ directly or over the network.
 | Configuration | `boot` | Inspect or set one-shot/persistent boot overrides |
 | Configuration | `user` | List users and administer names, access and passwords |
 | Configuration | `power` | Query and control chassis power |
+| Maintenance | `identify` (alias `blink`) | Blink or control the chassis identify LED |
+| Maintenance | `bmc` (alias `mc`) | Run the BMC self-test or issue a warm/cold BMC reset |
 
 Output is colored when writing to a terminal; it auto-disables for pipes, when
 `NO_COLOR` is set, or with `--no-color`.
@@ -42,6 +44,12 @@ To manage a **remote** BMC over the network (RMCP/RMCP+ / "IPMI over LAN"), use
 ipmicfg -H root:calvin@10.0.0.5        sensors   # default UDP port 623
 ipmicfg -H admin:secret@10.0.0.5:623   status
 ```
+
+The remote password is currently supplied on the command line, so it may be
+recorded in shell history or exposed in the process list. Use a dedicated,
+least-privileged BMC account and avoid putting production credentials in shared
+scripts. IPMI-over-LAN security depends on the authentication and cipher suites
+supported and enabled by the BMC; use it only on a trusted management network.
 
 Global options:
 
@@ -108,15 +116,28 @@ ipmicfg power off                  # confirms first
 ipmicfg power cycle
 ipmicfg power soft                 # graceful ACPI shutdown
 
+# Chassis identify LED
+ipmicfg identify                   # blink for 15 seconds
+ipmicfg identify on 60             # blink for 60 seconds
+ipmicfg identify force             # keep on until explicitly disabled
+ipmicfg identify off
+
+# BMC maintenance (this does not reset the host)
+ipmicfg bmc selftest
+ipmicfg bmc reset                  # cold reset; confirms first
+ipmicfg bmc reset --warm --yes
+
 # Guarded low-level diagnostics (hexadecimal and decimal bytes are accepted)
 ipmicfg raw 0x2e 0xf5 0x80 0x28 0x00 0x43 0xa6 0x00 0x00 0x38 --yes
 ```
 
-Destructive or lockout-prone operations (`power off/cycle/reset/diag`, `sel
-clear`, `lan set`, persistent boot overrides, and user mutations) prompt for
-confirmation. Supported actions accept `--yes` for deliberate automation.
-The generic `raw` interface always confirms unless `--yes` is supplied because
-an arbitrary vendor command may change controller or host state.
+Destructive or lockout-prone operations prompt for confirmation. `sel clear`,
+`sel delete`, `lan set`, persistent boot overrides, user mutations, and `bmc
+reset` accept `--yes` for deliberate automation. The disruptive power actions
+(`off`, `cycle`, `reset`, and `diag`) always prompt; they do not currently have a
+`--yes` option. The generic `raw` interface also always confirms unless `--yes`
+is supplied because an arbitrary vendor command may change controller or host
+state.
 
 ## Notes & limitations
 
