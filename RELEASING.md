@@ -3,6 +3,11 @@
 GitHub Actions builds x86_64 packages in Ubuntu 26.04 LTS and Fedora 44
 containers. Pull requests and pushes to `main` validate both packages; a version
 tag builds them again, creates checksums, and publishes a GitHub release.
+Push and manual runs skip package generation when the Cargo version is unchanged
+and its matching `v<version>` release is already published. Pull requests always
+validate packaging, and a manual run can select `force_build` to override the
+skip. Re-running a tag workflow for an already published version also exits
+without rebuilding or replacing its assets.
 
 ## Prepare the release
 
