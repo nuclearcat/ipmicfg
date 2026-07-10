@@ -883,8 +883,21 @@ fn clear(conn: &mut Conn, yes: bool) -> Result<(), String> {
 
     while matches!(progress, ErasureProgress::InProgress) {
         std::thread::sleep(std::time::Duration::from_millis(150));
+        // Initiating the erase changes the repository and therefore cancels
+        // the reservation used for that command. Some BMCs tolerate reusing
+        // it for status polling, but conforming implementations such as Cisco
+        // CIMC reject it with 0xC5. Acquire a fresh reservation for every
+        // status request because a Clear SEL command may cancel it again.
+        let status_reservation = if info.supported_cmds.contains(&SelCommand::Reserve) {
+            Some(
+                conn.send_recv(ReserveSel)
+                    .map_err(|e| format!("Reserve SEL for status failed: {e:?}"))?,
+            )
+        } else {
+            None
+        };
         progress = conn
-            .send_recv(ClearSel::get_status(reservation))
+            .send_recv(ClearSel::get_status(status_reservation))
             .map_err(|e| format!("Clear SEL status failed: {e:?}"))?;
     }
 
