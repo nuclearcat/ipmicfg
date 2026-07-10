@@ -72,6 +72,7 @@ pub fn manufacturer_name(id: u32) -> Option<&'static str> {
         0x00000B => "HP",
         0x00000E => "Fujitsu Siemens",
         0x000028 => "Dell",
+        0x0002A2 => "Dell",
         0x00005D => "ASUS",
         0x0000B0 => "Lenovo",
         0x000137 => "Fujitsu",

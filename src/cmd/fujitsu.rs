@@ -5,6 +5,7 @@
 //! translate its own vendor events instead of maintaining an incomplete table
 //! of OEM event bytes in the client.
 
+use ipmi_rs::app::GetDeviceId;
 use ipmi_rs::connection::NetFn;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -17,6 +18,7 @@ const NETFN_OEM_GROUP: u8 = 0x2E;
 const CMD_IRMC: u8 = 0xF5;
 const FUJITSU_IANA_LE: [u8; 3] = [0x80, 0x28, 0x00];
 const GET_SEL_ENTRY_LONG_TEXT: u8 = 0x43;
+const FUJITSU_MANUFACTURER_IDS: [u32; 3] = [0x00000E, 0x000137, 0x002880];
 
 // Documented maximum on Pilot-1 designs. It also keeps pagination exercised
 // and avoids assuming that every local IPMI driver accepts a 100-byte chunk.
@@ -75,6 +77,16 @@ pub(crate) struct DecodedSelEntry {
 }
 
 pub fn decode_sel_entries(conn: &mut Conn, record_ids: &[u16], debug: bool) -> Result<(), String> {
+    let device = conn
+        .send_recv(GetDeviceId)
+        .map_err(|error| format!("Get Device ID failed: {error:?}"))?;
+    if !is_fujitsu_manufacturer(device.manufacturer_id) {
+        return Err(format!(
+            "Fujitsu F5 43 decoding is unavailable on BMC manufacturer 0x{:06X}",
+            device.manufacturer_id
+        ));
+    }
+
     let mut decoded = Vec::with_capacity(record_ids.len());
     for &record_id in record_ids {
         decoded.push(fetch_long_text(conn, record_id, debug).map_err(|error| {
@@ -109,6 +121,10 @@ pub fn decode_sel_entries(conn: &mut Conn, record_ids: &[u16], debug: bool) -> R
     table.print();
     println!();
     Ok(())
+}
+
+pub(crate) fn is_fujitsu_manufacturer(manufacturer_id: u32) -> bool {
+    FUJITSU_MANUFACTURER_IDS.contains(&manufacturer_id)
 }
 
 pub(crate) fn fetch_long_text(
@@ -350,5 +366,13 @@ mod tests {
         let parsed = parse_long_text_response(&response(b"abcd", 4)).unwrap();
         validate_chunk(&parsed, None, 0x0000, 56, 0).unwrap();
         validate_chunk(&parsed, None, 0xFFFF, 56, 0).unwrap();
+    }
+
+    #[test]
+    fn recognizes_known_fujitsu_manufacturer_ids() {
+        assert!(is_fujitsu_manufacturer(0x00000E));
+        assert!(is_fujitsu_manufacturer(0x000137));
+        assert!(is_fujitsu_manufacturer(0x002880));
+        assert!(!is_fujitsu_manufacturer(0x0000B0));
     }
 }

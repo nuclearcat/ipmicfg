@@ -57,6 +57,10 @@ automate, and more complete for day-to-day server management.
   - [x] Decode Fujitsu iRMC OEM records through the controller's F5 43 long-text
     interface by default, with a local-decoding opt-out and optional
     request/response diagnostics.
+  - [x] Decode standard System Firmware Progress extension codes and classify
+    progress checkpoints as informational.
+  - [x] Distinguish Dell OEM diagnostic companion records from Link Tuning
+    failures and preserve their service-data bytes.
   - Preserve raw fields in JSON output, including OEM data.
 
 - [x] Expand `status` into a health summary.
