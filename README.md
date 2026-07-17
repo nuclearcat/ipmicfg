@@ -26,8 +26,8 @@ Output is colored when writing to a terminal; it auto-disables for pipes, when
 
 ## Install
 
-Release packages are built for 64-bit Ubuntu 26.04 LTS and Fedora 44. Download
-the `.deb` or `.rpm` from the matching
+Release packages are built for 64-bit Ubuntu 24.04 LTS, Ubuntu 26.04 LTS, and
+Fedora 44. Download the distro-specific `.deb` or `.rpm` from the matching
 [GitHub release](https://github.com/nuclearcat/ipmicfg/releases), then install it:
 
 ```sh

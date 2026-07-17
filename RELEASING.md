@@ -1,8 +1,10 @@
 # Releasing ipmicfg
 
-GitHub Actions builds x86_64 packages in Ubuntu 26.04 LTS and Fedora 44
-containers. Pull requests and pushes to `main` validate both packages; a version
-tag builds them again, creates checksums, and publishes a GitHub release.
+GitHub Actions builds x86_64 packages in Ubuntu 24.04 LTS, Ubuntu 26.04 LTS,
+and Fedora 44 containers. Pull requests and pushes to `main` validate all three
+packages; a version tag builds them again, creates checksums, and publishes a
+GitHub release. Ubuntu versions are included in `.deb` filenames so both builds
+remain visible as distinct release assets.
 Push and manual runs skip package generation when the Cargo version is unchanged
 and its matching `v<version>` release is already published. Pull requests always
 validate packaging, and a manual run can select `force_build` to override the
@@ -48,13 +50,13 @@ git push origin v0.2.0
 The `Release` workflow will:
 
 1. Reject a tag that does not match `Cargo.toml`.
-2. Test and build an Ubuntu `.deb` and Fedora `.rpm`.
+2. Test and build Ubuntu 24.04 and 26.04 `.deb` packages and a Fedora `.rpm`.
 3. Inspect the package metadata and contents.
 4. Create `SHA256SUMS`.
-5. Create the GitHub release with generated notes and attach all three files.
+5. Create the GitHub release with generated notes and attach all four files.
 
-After it completes, download both packages from the release and smoke-test them
-on representative Ubuntu and Fedora hosts:
+After it completes, download the packages from the release and smoke-test them
+on representative Ubuntu 24.04, Ubuntu 26.04, and Fedora hosts:
 
 ```sh
 # Ubuntu
@@ -89,10 +91,10 @@ GitHub before recreating the tag.
 The distro pins are intentional. When a new Ubuntu LTS or Fedora release becomes
 the supported target:
 
-1. Update the container image and artifact name in `packages.yml`.
+1. Update the Ubuntu matrix and artifact names in `packages.yml`.
 2. Update the supported versions in `README.md` and this guide.
 3. Check for newer pinned `cargo-deb` and `cargo-generate-rpm` versions.
-4. Open a pull request and verify that both package jobs pass before merging.
+4. Open a pull request and verify that all package jobs pass before merging.
 
 Ubuntu LTS releases receive five years of standard maintenance. Fedora releases
 are supported for about thirteen months, so expect to refresh the Fedora pin

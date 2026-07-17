@@ -103,11 +103,15 @@ jobs:
           echo "Decision: $reason" >> "$GITHUB_STEP_SUMMARY"
 
   deb:
-    name: Ubuntu 26.04 .deb (x86_64)
+    name: Ubuntu ${{ matrix.ubuntu }} .deb (x86_64)
     needs: preflight
     if: needs.preflight.outputs.build == 'true'
     runs-on: ubuntu-24.04
-    container: ubuntu:26.04
+    container: ubuntu:${{ matrix.ubuntu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ["24.04", "26.04"]
 
     steps:
       - name: Install build dependencies
@@ -140,10 +144,21 @@ jobs:
           dpkg-deb --extract target/debian/*.deb package-root
           package-root/usr/bin/ipmicfg --version
 
+      - name: Add Ubuntu version to package filename
+        shell: bash
+        run: |
+          package=(target/debian/*_amd64.deb)
+          if [[ "${#package[@]}" -ne 1 || ! -f "${package[0]}" ]]; then
+            echo "Expected exactly one amd64 Debian package" >&2
+            exit 1
+          fi
+          mv -- "${package[0]}" \
+            "${package[0]%_amd64.deb}_ubuntu${{ matrix.ubuntu }}_amd64.deb"
+
       - name: Upload Debian package
         uses: actions/upload-artifact@v4
         with:
-          name: ipmicfg-deb-ubuntu-26.04
+          name: ipmicfg-deb-ubuntu-${{ matrix.ubuntu }}
           path: target/debian/*.deb
           if-no-files-found: error
 
