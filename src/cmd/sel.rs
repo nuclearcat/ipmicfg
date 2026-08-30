@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use ipmi_rs::app::GetDeviceId;
 use ipmi_rs::connection::NetFn;
 use ipmi_rs::storage::sdr::record::{IdentifiableSensor, InstancedSensor, RecordContents};
 use ipmi_rs::storage::sdr::{EventData2Type, EventData3Type, SensorType};
@@ -14,7 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::cli::{SelAction, SelArgs, SelSeverity};
-use crate::cmd::{cisco, confirm, fujitsu};
+use crate::cmd::{bmc_manufacturer_id, cisco, confirm, fujitsu};
 use crate::conn::Conn;
 use crate::ui::{self, Align, Cell, Table};
 
@@ -420,12 +419,6 @@ fn sensor_names(conn: &mut Conn) -> Result<SensorNames, String> {
         names.insert(sensor_type, sensor_number, id);
     }
     Ok(names)
-}
-
-fn bmc_manufacturer_id(conn: &mut Conn) -> Option<u32> {
-    conn.send_recv(GetDeviceId)
-        .ok()
-        .map(|device| device.manufacturer_id)
 }
 
 /// Decode only records whose sensor or event type is in an OEM-defined range.
@@ -1027,24 +1020,12 @@ fn vendor_description(entry: &Entry, manufacturer_id: Option<u32>) -> Option<Str
         .or_else(|| cisco_led_indication(entry, manufacturer_id).map(str::to_string))
 }
 
-/// Decode Cisco CIMC LED sensors, which are Platform Alert sensors (24h)
-/// reported with the OEM event/reading type 7Fh.
+/// Describe one LED state change from a SEL record.
 ///
-/// The offsets are documented by example in the *Cisco UCS Faults and Error
-/// Messages Reference Guide*, "SEL Record Examples → LED Color Changes", which
-/// prints raw SEL records beside CIMC's own translation of them:
-///
-/// ```text
-/// .. 24 56 7f 00 04 10  ->  Platform alert LED_MEZZ_TP_FLT #0x56 | LED is off
-/// .. 24 56 7f 07 04 10  ->  Platform alert LED_MEZZ_TP_FLT #0x56 | LED color is red
-/// .. 24 58 7f 04 04 10  ->  Platform alert LED_SYS_ACT #0x58     | LED color is green
-/// .. 24 5a 7f 05 04 10  ->  Platform alert LED_SAS1_FAULT #0x5a  | LED color is amber
-/// ```
-///
-/// Offset 01h is not in that list, but it is the complement of 00h and shows up
-/// as such in practice: a healthy C-series reads 0x12 on every `LED_*_STATUS`
-/// sensor, which is offsets 01h and 04h asserted — "on" plus "green".
-/// Offsets 02h, 03h and 06h stay undecoded rather than guessed.
+/// A record reports a single offset, so it shows either the lit state or the
+/// colour changing, never the pair — which is why these stay informational
+/// here while the sensor readout, which sees the whole mask, can judge health.
+/// See [`cisco::led_state`] for the offset table and its source.
 fn cisco_led_indication(entry: &Entry, manufacturer_id: Option<u32>) -> Option<&'static str> {
     if !manufacturer_id.is_some_and(|id| CISCO_MANUFACTURER_IDS.contains(&id)) {
         return None;
@@ -1059,23 +1040,20 @@ fn cisco_led_indication(entry: &Entry, manufacturer_id: Option<u32>) -> Option<&
     else {
         return None;
     };
-    if *sensor_type != 0x24 || *event_type != 0x7F {
+    if *sensor_type != cisco::LED_SENSOR_TYPE || *event_type != cisco::LED_EVENT_TYPE {
         return None;
     }
 
-    let asserted = matches!(event_direction, EventDirection::Assert);
-    Some(match (event_data.offset, asserted) {
-        (0x00, true) => "LED is off",
-        (0x00, false) => "LED is no longer off",
-        (0x01, true) => "LED is on",
-        (0x01, false) => "LED is no longer on",
-        (0x04, true) => "LED color is green",
-        (0x04, false) => "LED color is no longer green",
-        (0x05, true) => "LED color is amber",
-        (0x05, false) => "LED color is no longer amber",
-        (0x07, true) => "LED color is red",
-        (0x07, false) => "LED color is no longer red",
-        _ => return None,
+    let state = cisco::led_state(event_data.offset)?;
+    if matches!(event_direction, EventDirection::Assert) {
+        return Some(state.label());
+    }
+    Some(match state {
+        cisco::LedState::Off => "LED is no longer off",
+        cisco::LedState::On => "LED is no longer on",
+        cisco::LedState::Green => "LED color is no longer green",
+        cisco::LedState::Amber => "LED color is no longer amber",
+        cisco::LedState::Red => "LED color is no longer red",
     })
 }
 

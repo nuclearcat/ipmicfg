@@ -1,4 +1,12 @@
-//! Cisco CIMC Extended Sensor Range (ESR) helpers.
+//! Cisco CIMC vendor decoding: the LED sensors, and the Extended Sensor Range.
+//!
+//! # LED sensors
+//!
+//! CIMC exposes the chassis LEDs as Platform Alert sensors reported with an OEM
+//! event/reading type, so neither their SEL events nor their readings decode
+//! against the IPMI tables. See [`led_state`].
+//!
+//! # Extended Sensor Range
 //!
 //! Cisco UCS servers can carry more sensors than IPMI's 8-bit sensor number
 //! allows, so CIMC keeps a parallel repository addressed by a 32-bit sensor
@@ -21,6 +29,70 @@ use crate::conn::Conn;
 /// IANA 5771. The Cisco ESR algorithm keys on this exact ID: IANA 9 is also
 /// registered to Cisco, but UCS servers report 0x168B.
 pub const UCS_MANUFACTURER_ID: u32 = 0x00168B;
+
+/// Sensor type and event/reading type of the Cisco LED sensors.
+pub const LED_SENSOR_TYPE: u8 = 0x24;
+pub const LED_EVENT_TYPE: u8 = 0x7F;
+
+/// One state a Cisco LED sensor reports.
+///
+/// A single LED carries two independent fields at once: whether it is lit, and
+/// what colour it is set to. Both are asserted as separate offsets of the same
+/// sensor, so a reading can hold one of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedState {
+    Off,
+    On,
+    Green,
+    Amber,
+    Red,
+}
+
+impl LedState {
+    /// CIMC's own wording for the state.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "LED is off",
+            Self::On => "LED is on",
+            Self::Green => "LED color is green",
+            Self::Amber => "LED color is amber",
+            Self::Red => "LED color is red",
+        }
+    }
+
+    pub fn is_color(self) -> bool {
+        matches!(self, Self::Green | Self::Amber | Self::Red)
+    }
+}
+
+/// Decode one offset of a Cisco LED sensor.
+///
+/// The offsets are documented by example in the *Cisco UCS Faults and Error
+/// Messages Reference Guide*, "SEL Record Examples → LED Color Changes", which
+/// prints raw SEL records beside CIMC's own translation of them:
+///
+/// ```text
+/// .. 24 56 7f 00 04 10  ->  Platform alert LED_MEZZ_TP_FLT #0x56 | LED is off
+/// .. 24 56 7f 07 04 10  ->  Platform alert LED_MEZZ_TP_FLT #0x56 | LED color is red
+/// .. 24 58 7f 04 04 10  ->  Platform alert LED_SYS_ACT #0x58     | LED color is green
+/// .. 24 5a 7f 05 04 10  ->  Platform alert LED_SAS1_FAULT #0x5a  | LED color is amber
+/// ```
+///
+/// Offset 01h is not in that list, but it is the complement of 00h and shows up
+/// as such in practice: a healthy C-series reads 0x12 on every `LED_*_STATUS`
+/// sensor, which is offsets 01h and 04h asserted — "on" plus "green".
+/// Offsets 02h, 03h and 06h stay undecoded rather than guessed; 06h is a colour
+/// this hardware does use, but not one Cisco names anywhere we can cite.
+pub fn led_state(offset: u8) -> Option<LedState> {
+    Some(match offset {
+        0x00 => LedState::Off,
+        0x01 => LedState::On,
+        0x04 => LedState::Green,
+        0x05 => LedState::Amber,
+        0x07 => LedState::Red,
+        _ => return None,
+    })
+}
 
 const CMD_GET_ESR_CAPABILITIES: u8 = 0xF5;
 const CMD_GET_ESR_SEL_INFO: u8 = 0xF2;
@@ -120,6 +192,32 @@ mod tests {
         data.extend_from_slice(&[1, 2, 3]); // API version, doc minor, doc major
         data.extend_from_slice(&[0; 27]); // reserved
         data
+    }
+
+    #[test]
+    fn decodes_documented_led_offsets() {
+        assert_eq!(led_state(0x00).map(LedState::label), Some("LED is off"));
+        assert_eq!(led_state(0x01).map(LedState::label), Some("LED is on"));
+        assert_eq!(
+            led_state(0x04).map(LedState::label),
+            Some("LED color is green")
+        );
+        assert_eq!(
+            led_state(0x05).map(LedState::label),
+            Some("LED color is amber")
+        );
+        assert_eq!(
+            led_state(0x07).map(LedState::label),
+            Some("LED color is red")
+        );
+        // Undocumented offsets, including the colour 06h this hardware uses.
+        for offset in [0x02, 0x03, 0x06, 0x08, 0x0F] {
+            assert_eq!(led_state(offset), None, "offset {offset:#04X}");
+        }
+
+        assert!(!LedState::Off.is_color());
+        assert!(!LedState::On.is_color());
+        assert!(LedState::Amber.is_color());
     }
 
     #[test]

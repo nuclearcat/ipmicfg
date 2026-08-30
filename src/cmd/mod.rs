@@ -14,6 +14,7 @@ pub mod sensors;
 pub mod status;
 pub mod user;
 
+use ipmi_rs::app::GetDeviceId;
 use ipmi_rs::connection::NetFn;
 
 use crate::conn::Conn;
@@ -63,6 +64,16 @@ pub fn restore_policy_name(policy: u8) -> &'static str {
         0b10 => "always on",
         _ => "unknown",
     }
+}
+
+/// The BMC's IANA manufacturer ID, or `None` when it cannot be read.
+///
+/// Vendor decoding is always optional, so a controller that will not answer
+/// Get Device ID costs the caller its vendor tables, never the command.
+pub fn bmc_manufacturer_id(conn: &mut Conn) -> Option<u32> {
+    conn.send_recv(GetDeviceId)
+        .ok()
+        .map(|device| device.manufacturer_id)
 }
 
 /// Map an IANA enterprise number to a vendor name (common server vendors).
