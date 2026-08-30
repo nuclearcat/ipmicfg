@@ -546,16 +546,22 @@ fn parse_time(value: &str) -> Result<i64, String> {
         .map_err(|_| format!("invalid time '{value}'; use RFC 3339 or a Unix timestamp"))
 }
 
-fn entry_timestamp(entry: &Entry) -> Option<i64> {
+/// The timestamp as the SEL table renders it, or `None` for a record that
+/// carries no usable time — an untimestamped OEM record, or a controller that
+/// has not had its clock set.
+fn entry_timestamp_text(entry: &Entry) -> Option<String> {
     let rendered = match entry {
         Entry::System { timestamp, .. } | Entry::OemTimestamped { timestamp, .. } => {
             timestamp.to_string()
         }
         Entry::OemNotTimestamped { .. } => return None,
     };
-    if rendered == "Unknown" {
-        None
-    } else if let Ok(unix) = rendered.parse::<i64>() {
+    (rendered != "Unknown").then_some(rendered)
+}
+
+fn entry_timestamp(entry: &Entry) -> Option<i64> {
+    let rendered = entry_timestamp_text(entry)?;
+    if let Ok(unix) = rendered.parse::<i64>() {
         Some(unix)
     } else {
         OffsetDateTime::parse(&rendered, &Rfc3339)
@@ -1357,8 +1363,11 @@ pub fn health_summary(conn: &mut Conn, recent_limit: usize) -> Result<HealthSumm
         .take(recent_limit)
         .map(|entry| {
             format!(
-                "0x{:04X}: {}",
+                "0x{:04X}  {}  {}",
                 entry_id(entry).value(),
+                // Keep the column aligned when one record of several is
+                // untimestamped, rather than shifting the description left.
+                entry_timestamp_text(entry).unwrap_or_else(|| "—".to_string()),
                 display_entry_description(
                     entry,
                     raw_event_data.get(&entry_id(entry).value()).copied()
@@ -1953,6 +1962,21 @@ mod tests {
         assert_eq!(names.get(0xDC, 1), Some("CPU Temp"));
         assert_eq!(names.get(0x01, 1), Some("CPU Temp"));
         assert_eq!(names.get(0xDC, 26), None);
+    }
+
+    #[test]
+    fn renders_entry_timestamps_for_the_status_summary() {
+        let entry = system_event(EventDirection::Assert, 0x01, 0);
+        assert_eq!(
+            entry_timestamp_text(&entry).as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(entry_timestamp(&entry), Some(1_700_000_000));
+
+        // An OEM record with no timestamp field has no time to show.
+        let untimestamped = oem(1, [0; 13]);
+        assert_eq!(entry_timestamp_text(&untimestamped), None);
+        assert_eq!(entry_timestamp(&untimestamped), None);
     }
 
     #[test]
