@@ -474,6 +474,14 @@ fn entry_sensor(entry: &Entry, names: &SensorNames) -> String {
 }
 
 /// Infer severity because SEL records do not contain a standard severity field.
+///
+/// Severity comes from the `(sensor type, event type, offset, direction)` tuple
+/// wherever the IPMI spec fixes the meaning of an offset. The rendered English
+/// is only a last resort, for OEM records and vendor text we cannot decode:
+/// matching keywords in a description is unreliable, because the spec's own
+/// wording puts "failure" in the name of a *cleared* fault ("Predictive Failure
+/// deasserted") and "present" in the name of a live one ("Power Supply input
+/// out-of-range, but present").
 pub fn entry_severity(entry: &Entry) -> SelSeverity {
     let Entry::System {
         sensor_type,
@@ -485,23 +493,13 @@ pub fn entry_severity(entry: &Entry) -> SelSeverity {
     else {
         return SelSeverity::Unknown;
     };
-    if *event_direction == EventDirection::Deassert {
-        return SelSeverity::Normal;
-    }
-    if *sensor_type == 0x0F && *event_type == 0x6F {
-        return match event_data.offset {
-            0x02 => SelSeverity::Normal,
-            0x00 | 0x01 => SelSeverity::Critical,
-            _ => SelSeverity::Unknown,
-        };
-    }
-    if *sensor_type == 0x09 && *event_type == 0x6F && event_data.offset == 0x00 {
-        // Power-off/down is an operational state transition. It commonly
-        // occurs as an asserted/deasserted pair during a normal restart and is
-        // not, by itself, a power fault.
-        return SelSeverity::Normal;
-    }
+
+    // Threshold sensors (event type 01h): the offset names a threshold
+    // crossing, and a deassertion means the reading came back inside it.
     if *event_type == 0x01 {
+        if *event_direction == EventDirection::Deassert {
+            return SelSeverity::Normal;
+        }
         return match event_data.offset {
             0 | 1 | 6 | 7 => SelSeverity::Warning,
             2..=5 | 8..=11 => SelSeverity::Critical,
@@ -509,13 +507,195 @@ pub fn entry_severity(entry: &Entry) -> SelSeverity {
         };
     }
 
-    let description = entry_description(entry).to_ascii_lowercase();
-    if description.is_empty() {
-        return SelSeverity::Unknown;
+    // Discrete events: the offset names a *state*, and the direction says
+    // whether the sensor entered that state or left it.
+    if let Some(asserted) = discrete_state_severity(*sensor_type, *event_type, event_data.offset) {
+        return match event_direction {
+            EventDirection::Assert => asserted,
+            // A fault state that goes away is a recovery. Leaving a state that
+            // was informational to begin with stays informational.
+            EventDirection::Deassert => match asserted {
+                SelSeverity::Warning | SelSeverity::Critical => SelSeverity::Normal,
+                other => other,
+            },
+        };
     }
-    severity_from_description(&description).unwrap_or(SelSeverity::Warning)
+
+    // Nothing decoded the offset. Fall back to keywords in whatever text the
+    // library or our OEM decoders produced, and refuse to guess beyond that:
+    // an undecoded record is unknown, not a warning.
+    severity_from_description(&entry_description(entry).to_ascii_lowercase())
+        .unwrap_or(SelSeverity::Unknown)
 }
 
+/// Severity of the state a discrete event offset names, as seen when the sensor
+/// *asserts* it. `None` means the offset carries no fixed meaning and the caller
+/// should fall back to the rendered description.
+fn discrete_state_severity(sensor_type: u8, event_type: u8, offset: u8) -> Option<SelSeverity> {
+    // Entity Presence sensors (25h) report inventory, not health, in either the
+    // sensor-specific or the generic device-presence form. A BMC restart
+    // re-reports every entity it can see, and pins such as BIOS "POST complete"
+    // drop on every reset; neither direction is a fault on its own.
+    if sensor_type == 0x25 {
+        return match (event_type, offset) {
+            (0x6F, 0x02) => Some(SelSeverity::Warning), // Entity Disabled
+            (0x6F | 0x08, 0x00 | 0x01) => Some(SelSeverity::Normal),
+            _ => None,
+        };
+    }
+    match event_type {
+        0x02..=0x0C => generic_discrete_severity(event_type, offset),
+        0x6F => sensor_specific_severity(sensor_type, offset),
+        // 70h–7Fh are OEM event types with no defined offsets, and anything
+        // else is not a discrete event at all.
+        _ => None,
+    }
+}
+
+/// Generic event/reading types 02h–0Ch — IPMI 2.0 Table 42-2.
+fn generic_discrete_severity(event_type: u8, offset: u8) -> Option<SelSeverity> {
+    use SelSeverity::{Critical, Normal, Warning};
+    let severity = match (event_type, offset) {
+        // 02h Usage State — idle/active/busy are operational states.
+        (0x02, 0x00..=0x02) => Normal,
+        // 03h State — "asserted" means whatever the sensor says it means:
+        // a PWRGD pin asserted is healthy, a fault pin asserted is not.
+        // Deliberately left undecoded.
+        (0x03, _) => return None,
+        // 04h Predictive Failure. Offset 00h is the *cleared* state; the
+        // assertion is a prediction, not a failure that has happened.
+        (0x04, 0x00) => Normal,
+        (0x04, 0x01) => Warning,
+        // 05h Limit
+        (0x05, 0x00) => Normal,
+        (0x05, 0x01) => Critical,
+        // 06h Performance
+        (0x06, 0x00) => Normal,
+        (0x06, 0x01) => Warning,
+        // 07h Severity — 07h "Monitor" and 08h "Informational" are not faults.
+        (0x07, 0x00 | 0x07 | 0x08) => Normal,
+        (0x07, 0x01 | 0x04) => Warning,
+        (0x07, 0x02 | 0x03 | 0x05 | 0x06) => Critical,
+        // 08h Device Presence
+        (0x08, 0x00) => Warning,
+        (0x08, 0x01) => Normal,
+        // 09h Device Enabled
+        (0x09, 0x00) => Warning,
+        (0x09, 0x01) => Normal,
+        // 0Ah Availability State
+        (0x0A, 0x00..=0x03 | 0x05 | 0x07) => Normal,
+        (0x0A, 0x04 | 0x06) => Warning,
+        (0x0A, 0x08) => Critical,
+        // 0Bh Redundancy State
+        (0x0B, 0x00) => Normal,
+        (0x0B, 0x02..=0x04 | 0x06 | 0x07) => Warning,
+        (0x0B, 0x01 | 0x05) => Critical,
+        // 0Ch ACPI Device Power State
+        (0x0C, 0x00..=0x03) => Normal,
+        _ => return None,
+    };
+    Some(severity)
+}
+
+/// Sensor-specific offsets (event type 6Fh) — IPMI 2.0 Table 42-3.
+fn sensor_specific_severity(sensor_type: u8, offset: u8) -> Option<SelSeverity> {
+    use SelSeverity::{Critical, Normal, Warning};
+    let severity = match (sensor_type, offset) {
+        // 05h Physical Security (Chassis Intrusion)
+        (0x05, 0x00..=0x06) => Warning,
+        // 06h Platform Security Violation Attempt
+        (0x06, 0x00..=0x05) => Warning,
+        // 07h Processor
+        (0x07, 0x07 | 0x09) => Normal,
+        (0x07, 0x05 | 0x08 | 0x0A | 0x0C) => Warning,
+        (0x07, 0x00..=0x04 | 0x06 | 0x0B) => Critical,
+        // 08h Power Supply. 05h is "input out-of-range, but present": the
+        // supply is still installed, but its feed is out of spec.
+        (0x08, 0x00) => Normal,
+        (0x08, 0x02 | 0x05 | 0x06 | 0x07) => Warning,
+        (0x08, 0x01 | 0x03 | 0x04) => Critical,
+        // 09h Power Unit. Power-off/down and power-cycle commonly occur as an
+        // assert/deassert pair during a normal restart and are not faults.
+        (0x09, 0x00 | 0x01 | 0x03) => Normal,
+        (0x09, 0x02 | 0x07) => Warning,
+        (0x09, 0x04..=0x06) => Critical,
+        // 0Ch Memory
+        (0x0C, 0x06 | 0x08) => Normal,
+        (0x0C, 0x00 | 0x04 | 0x05 | 0x07 | 0x09) => Warning,
+        (0x0C, 0x01..=0x03 | 0x0A) => Critical,
+        // 0Dh Drive Slot (Bay)
+        (0x0D, 0x00 | 0x03 | 0x04) => Normal,
+        (0x0D, 0x02 | 0x07 | 0x08) => Warning,
+        (0x0D, 0x01 | 0x05 | 0x06) => Critical,
+        // 0Fh System Firmware Progress
+        (0x0F, 0x02) => Normal,
+        (0x0F, 0x00 | 0x01) => Critical,
+        // 10h Event Logging Disabled
+        (0x10, 0x02) => Normal,
+        (0x10, 0x00 | 0x01 | 0x03..=0x06) => Warning,
+        // 11h Watchdog 1
+        (0x11, 0x06 | 0x07) => Warning,
+        (0x11, 0x00..=0x05) => Critical,
+        // 12h System Event — boot events, clock sync and log annotations are
+        // informational; only 02h reports actual hardware trouble.
+        (0x12, 0x00 | 0x01 | 0x03 | 0x05) => Normal,
+        (0x12, 0x04) => Warning,
+        (0x12, 0x02) => Critical,
+        // 13h Critical Interrupt
+        (0x13, 0x03 | 0x07 | 0x0B) => Warning,
+        (0x13, 0x00..=0x02 | 0x04..=0x06 | 0x08..=0x0A) => Critical,
+        // 14h Button / Switch
+        (0x14, 0x00..=0x02 | 0x04) => Normal,
+        (0x14, 0x03) => Warning,
+        // 19h Chip Set
+        (0x19, 0x00 | 0x01) => Critical,
+        // 1Dh System Boot / Restart Initiated
+        (0x1D, 0x00..=0x07) => Normal,
+        // 1Eh Boot Error
+        (0x1E, 0x01 | 0x04) => Warning,
+        (0x1E, 0x00 | 0x02 | 0x03) => Critical,
+        // 1Fh Base OS Boot / Installation Status
+        (0x1F, 0x00..=0x08) => Normal,
+        (0x1F, 0x09) => Warning,
+        (0x1F, 0x0A) => Critical,
+        // 20h OS Stop / Shutdown
+        (0x20, 0x02 | 0x03) => Normal,
+        (0x20, 0x04 | 0x05) => Warning,
+        (0x20, 0x00 | 0x01) => Critical,
+        // 22h System ACPI Power State
+        (0x22, 0x00..=0x0C | 0x0E) => Normal,
+        // 23h Watchdog 2
+        (0x23, 0x00 | 0x08) => Warning,
+        (0x23, 0x01..=0x03) => Critical,
+        // 24h Platform Alert
+        (0x24, 0x00..=0x03) => Warning,
+        // 25h Entity Presence is handled by `discrete_state_severity`.
+        // 27h LAN
+        (0x27, 0x00) => Warning,
+        (0x27, 0x01) => Normal,
+        // 28h Management Subsystem Health
+        (0x28, 0x00..=0x04) => Warning,
+        (0x28, 0x05) => Critical,
+        // 29h Battery
+        (0x29, 0x02) => Normal,
+        (0x29, 0x00) => Warning,
+        (0x29, 0x01) => Critical,
+        // 2Ah Session Audit
+        (0x2A, 0x00 | 0x01) => Normal,
+        (0x2A, 0x02 | 0x03) => Warning,
+        // 2Bh Version Change
+        (0x2B, 0x00 | 0x01 | 0x06 | 0x07) => Normal,
+        (0x2B, 0x02..=0x05) => Warning,
+        // 2Ch FRU State
+        (0x2C, 0x00..=0x06) => Normal,
+        (0x2C, 0x07) => Critical,
+        _ => return None,
+    };
+    Some(severity)
+}
+
+/// Last-resort keyword match over rendered event text, for OEM records and
+/// vendor strings that no offset table covers.
 fn severity_from_description(description: &str) -> Option<SelSeverity> {
     let description = description.to_ascii_lowercase();
     if [
@@ -538,9 +718,14 @@ fn severity_from_description(description: &str) -> Option<SelSeverity> {
     {
         Some(SelSeverity::Critical)
     } else if [
-        "present",
-        "enabled",
+        // Match presence phrases in full: bare "present" is a substring of
+        // "out-of-range, but present", and does not appear in "presence".
+        "presence detected",
+        "device present",
+        "device inserted",
+        "entity present",
         "fully redundant",
+        "enabled",
         "power on",
         "running",
         "recovered",
@@ -550,7 +735,7 @@ fn severity_from_description(description: &str) -> Option<SelSeverity> {
     .any(|word| description.contains(word))
     {
         Some(SelSeverity::Normal)
-    } else if ["warning", "degraded", "predictive"]
+    } else if ["warning", "degraded", "predictive", "out-of-range"]
         .iter()
         .any(|word| description.contains(word))
     {
@@ -1089,6 +1274,22 @@ mod tests {
         assert_eq!(g.text, "abcdefghijk");
     }
 
+    fn sensor_event(
+        sensor_type: u8,
+        direction: EventDirection,
+        event_type: u8,
+        offset: u8,
+    ) -> Entry {
+        let mut entry = system_event(direction, event_type, offset);
+        if let Entry::System {
+            sensor_type: ty, ..
+        } = &mut entry
+        {
+            *ty = sensor_type;
+        }
+        entry
+    }
+
     fn system_event(direction: EventDirection, event_type: u8, offset: u8) -> Entry {
         Entry::System {
             record_id: RecordId::new(1).expect("valid record id"),
@@ -1267,6 +1468,104 @@ mod tests {
             Some(SelSeverity::Critical)
         );
         assert_eq!(severity_from_description("vendor state 42"), None);
+    }
+
+    #[test]
+    fn reads_predictive_failure_from_the_offset_not_the_word_failure() {
+        // Generic event type 04h names the *cleared* state at offset 00h, so
+        // the rendered text is "Predictive Failure deasserted" on a record that
+        // reports a recovery. Keyword matching used to call that critical.
+        let cleared = sensor_event(0x08, EventDirection::Assert, 0x04, 0x00);
+        assert_eq!(entry_description(&cleared), "Predictive Failure deasserted");
+        assert_eq!(entry_severity(&cleared), SelSeverity::Normal);
+
+        let raised = sensor_event(0x08, EventDirection::Assert, 0x04, 0x01);
+        assert_eq!(entry_description(&raised), "Predictive Failure asserted");
+        assert_eq!(entry_severity(&raised), SelSeverity::Warning);
+    }
+
+    #[test]
+    fn classifies_power_supply_presence_and_input_faults() {
+        // "Presence detected" is healthy but does not contain the word
+        // "present"; "input out-of-range, but present" does, and is a fault.
+        let present = sensor_event(0x08, EventDirection::Assert, 0x6F, 0x00);
+        assert_eq!(entry_description(&present), "Presence detected");
+        assert_eq!(entry_severity(&present), SelSeverity::Normal);
+
+        let out_of_range = sensor_event(0x08, EventDirection::Assert, 0x6F, 0x05);
+        assert_eq!(
+            entry_description(&out_of_range),
+            "Power Supply input out-of-range, but present"
+        );
+        assert_eq!(entry_severity(&out_of_range), SelSeverity::Warning);
+
+        let input_lost = sensor_event(0x08, EventDirection::Assert, 0x6F, 0x03);
+        assert_eq!(entry_severity(&input_lost), SelSeverity::Critical);
+
+        // The supply recovering from a fault state is a recovery, not a fault.
+        let recovered = sensor_event(0x08, EventDirection::Deassert, 0x6F, 0x05);
+        assert_eq!(entry_severity(&recovered), SelSeverity::Normal);
+    }
+
+    #[test]
+    fn treats_entity_presence_transitions_as_inventory() {
+        // BMC restarts re-report every entity and BIOS POST-complete pins drop
+        // on every reset, in either the generic 08h or sensor-specific form.
+        for event_type in [0x08, 0x6F] {
+            for offset in [0x00, 0x01] {
+                let entry = sensor_event(0x25, EventDirection::Assert, event_type, offset);
+                assert_eq!(
+                    entry_severity(&entry),
+                    SelSeverity::Normal,
+                    "entity presence {event_type:#04X}/{offset:#04X}"
+                );
+            }
+        }
+        let disabled = sensor_event(0x25, EventDirection::Assert, 0x6F, 0x02);
+        assert_eq!(entry_severity(&disabled), SelSeverity::Warning);
+    }
+
+    #[test]
+    fn treats_boot_and_clock_system_events_as_informational() {
+        for offset in [0x00, 0x01, 0x03, 0x05] {
+            let entry = sensor_event(0x12, EventDirection::Assert, 0x6F, offset);
+            assert_eq!(
+                entry_severity(&entry),
+                SelSeverity::Normal,
+                "system event offset {offset:#04X}"
+            );
+        }
+        let hardware_failure = sensor_event(0x12, EventDirection::Assert, 0x6F, 0x02);
+        assert_eq!(entry_severity(&hardware_failure), SelSeverity::Critical);
+    }
+
+    #[test]
+    fn refuses_to_guess_severity_for_ambiguous_or_oem_discrete_events() {
+        // Generic 03h "State Asserted"/"State Deasserted" means whatever the
+        // sensor decides: a PWRGD pin asserted is healthy, a fault pin is not.
+        for offset in [0x00, 0x01] {
+            let entry = sensor_event(0x08, EventDirection::Assert, 0x03, offset);
+            assert_eq!(entry_severity(&entry), SelSeverity::Unknown);
+        }
+
+        // OEM event types carry no defined offsets, so both directions are
+        // equally undecodable — the direction alone must not imply recovery.
+        let asserted = sensor_event(0xDC, EventDirection::Assert, 0x74, 0x07);
+        let deasserted = sensor_event(0xDC, EventDirection::Deassert, 0x74, 0x03);
+        assert_eq!(entry_severity(&asserted), SelSeverity::Unknown);
+        assert_eq!(entry_severity(&deasserted), SelSeverity::Unknown);
+    }
+
+    #[test]
+    fn keyword_fallback_no_longer_confuses_presence_with_present() {
+        assert_eq!(
+            severity_from_description("presence detected"),
+            Some(SelSeverity::Normal)
+        );
+        assert_eq!(
+            severity_from_description("power supply input out-of-range, but present"),
+            Some(SelSeverity::Warning)
+        );
     }
 
     #[test]
