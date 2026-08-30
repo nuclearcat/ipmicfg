@@ -43,25 +43,33 @@ pub const LED_EVENT_TYPE: u8 = 0x7F;
 pub enum LedState {
     Off,
     On,
+    Blinking,
     Green,
     Amber,
     Red,
 }
 
 impl LedState {
-    /// CIMC's own wording for the state.
+    /// CIMC's own wording for the state, where Cisco publishes one.
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "LED is off",
             Self::On => "LED is on",
+            Self::Blinking => "LED is blinking",
             Self::Green => "LED color is green",
             Self::Amber => "LED color is amber",
             Self::Red => "LED color is red",
         }
     }
 
-    pub fn is_color(self) -> bool {
-        matches!(self, Self::Green | Self::Amber | Self::Red)
+    /// Whether the LED is emitting light. `None` for a colour, which says
+    /// nothing on its own: CIMC assigns a colour to LEDs that are switched off.
+    pub fn lit(self) -> Option<bool> {
+        match self {
+            Self::Off => Some(false),
+            Self::On | Self::Blinking => Some(true),
+            Self::Green | Self::Amber | Self::Red => None,
+        }
     }
 }
 
@@ -78,15 +86,25 @@ impl LedState {
 /// .. 24 5a 7f 05 04 10  ->  Platform alert LED_SAS1_FAULT #0x5a  | LED color is amber
 /// ```
 ///
-/// Offset 01h is not in that list, but it is the complement of 00h and shows up
-/// as such in practice: a healthy C-series reads 0x12 on every `LED_*_STATUS`
-/// sensor, which is offsets 01h and 04h asserted — "on" plus "green".
-/// Offsets 02h, 03h and 06h stay undecoded rather than guessed; 06h is a colour
-/// this hardware does use, but not one Cisco names anywhere we can cite.
+/// Two more offsets are established by observation rather than by Cisco:
+///
+/// - **01h**, the complement of 00h: a healthy C-series reads 0x12 on every
+///   `LED_*_STATUS` sensor, which is offsets 01h and 04h — "on" plus "green".
+/// - **02h**, a second lit state, established causally on a C240 M4. Driving
+///   the chassis identify LED with Chassis Identify (`identify`) moved
+///   `FP_ID_LED` from 0x41 to 0x44 and back, repeatably — offset 00h giving way
+///   to 02h while the colour bit held. Timed blink and force-on both produce
+///   it, so the two cannot be told apart from IPMI; "blinking" is what a
+///   locator LED does, but we never saw the panel.
+///
+/// Offsets 03h and 06h stay undecoded. 06h is a colour this hardware does use —
+/// it is the identify LED's, held across that whole experiment — but Cisco
+/// names it nowhere citable, and a datacenter machine offers no way to look.
 pub fn led_state(offset: u8) -> Option<LedState> {
     Some(match offset {
         0x00 => LedState::Off,
         0x01 => LedState::On,
+        0x02 => LedState::Blinking,
         0x04 => LedState::Green,
         0x05 => LedState::Amber,
         0x07 => LedState::Red,
@@ -199,6 +217,10 @@ mod tests {
         assert_eq!(led_state(0x00).map(LedState::label), Some("LED is off"));
         assert_eq!(led_state(0x01).map(LedState::label), Some("LED is on"));
         assert_eq!(
+            led_state(0x02).map(LedState::label),
+            Some("LED is blinking")
+        );
+        assert_eq!(
             led_state(0x04).map(LedState::label),
             Some("LED color is green")
         );
@@ -210,14 +232,17 @@ mod tests {
             led_state(0x07).map(LedState::label),
             Some("LED color is red")
         );
-        // Undocumented offsets, including the colour 06h this hardware uses.
-        for offset in [0x02, 0x03, 0x06, 0x08, 0x0F] {
+        // Undecoded offsets, including the colour 06h this hardware uses.
+        for offset in [0x03, 0x06, 0x08, 0x0F] {
             assert_eq!(led_state(offset), None, "offset {offset:#04X}");
         }
 
-        assert!(!LedState::Off.is_color());
-        assert!(!LedState::On.is_color());
-        assert!(LedState::Amber.is_color());
+        // Lit state and colour are separate fields of one sensor.
+        assert_eq!(LedState::Off.lit(), Some(false));
+        assert_eq!(LedState::On.lit(), Some(true));
+        assert_eq!(LedState::Blinking.lit(), Some(true));
+        assert_eq!(LedState::Amber.lit(), None);
+        assert_eq!(LedState::Red.lit(), None);
     }
 
     #[test]
