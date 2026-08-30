@@ -12,7 +12,8 @@ use ipmi_rs::storage::sel::{
     Entry, EventDirection, EventGenerator, EventMessageRevision, RecordId,
 };
 
-use crate::cli::{SensorState, SensorsArgs};
+use crate::cli::{SelSeverity, SensorState, SensorsArgs};
+use crate::cmd::sel;
 use crate::conn::Conn;
 use crate::ui::{self, Align, Cell, Status, Table};
 
@@ -322,7 +323,10 @@ fn read_discrete(conn: &mut Conn, sensor: &DiscreteSensor<'_>) -> Result<(Status
             continue;
         }
         let description = discrete_description(sensor.ty, sensor.event_code, offset);
-        status = worst(status, discrete_state_status(&description));
+        status = worst(
+            status,
+            discrete_state_status(sensor.ty, sensor.event_code, offset, &description),
+        );
         descriptions.push(description);
     }
     Ok((
@@ -382,7 +386,37 @@ fn has_unknown_semantics(code: EventReadingTypeCodes) -> bool {
     )
 }
 
-fn discrete_state_status(description: &str) -> Status {
+/// Classify one asserted state of a discrete sensor.
+///
+/// The `(sensor type, event type, offset)` tuple is authoritative wherever the
+/// IPMI spec fixes an offset's meaning, and is shared with the SEL decoder so
+/// the two agree. Matching keywords in the rendered English is only a fallback
+/// for states the spec leaves to the vendor: it reads "Limit Not Exceeded" as a
+/// limit problem and "Predictive Failure deasserted" as a failure.
+fn discrete_state_status(
+    sensor_type: SensorType,
+    event_code: EventReadingTypeCodes,
+    offset: u8,
+    description: &str,
+) -> Status {
+    if let Some(severity) =
+        sel::discrete_state_severity(sensor_type.into(), event_code_value(event_code), offset)
+    {
+        return match severity {
+            SelSeverity::Normal => Status::Ok,
+            SelSeverity::Warning => Status::Warn,
+            SelSeverity::Critical => Status::Crit,
+            SelSeverity::Unknown => Status::Unknown,
+        };
+    }
+    status_from_description(description)
+}
+
+/// Last-resort classification of a state we could not decode from its offset.
+///
+/// An unrecognized state is unknown, not a warning: defaulting to a warning
+/// turns every vendor-defined state into a false alarm.
+fn status_from_description(description: &str) -> Status {
     let value = description.to_ascii_lowercase();
     if [
         "predictive failure",
@@ -424,7 +458,7 @@ fn discrete_state_status(description: &str) -> Status {
     {
         Status::Ok
     } else {
-        Status::Warn
+        Status::Unknown
     }
 }
 
@@ -665,12 +699,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_discrete_descriptions() {
-        assert_eq!(discrete_state_status("Power supply failure"), Status::Crit);
-        assert_eq!(discrete_state_status("Predictive failure"), Status::Warn);
-        assert_eq!(discrete_state_status("Redundancy degraded"), Status::Warn);
-        assert_eq!(discrete_state_status("Device Present"), Status::Ok);
-        assert_eq!(discrete_state_status("vendor state"), Status::Warn);
+    fn classifies_discrete_states_by_offset_before_wording() {
+        let status = |sensor_type: u8, event_type: u8, offset: u8| {
+            discrete_state_status(
+                sensor_type.into(),
+                EventReadingTypeCodes::from(event_type),
+                offset,
+                &discrete_description(sensor_type.into(), event_type.into(), offset),
+            )
+        };
+
+        // Event type 05h "Limit": offset 0 is the healthy state, and its name
+        // contains the word that the keyword fallback reads as a fault.
+        assert_eq!(status(0x07, 0x05, 0x00), Status::Ok);
+        assert_eq!(status(0x07, 0x05, 0x01), Status::Crit);
+        // Event type 04h "Predictive Failure": offset 0 is the cleared state.
+        assert_eq!(status(0x08, 0x04, 0x00), Status::Ok);
+        assert_eq!(status(0x08, 0x04, 0x01), Status::Warn);
+        // Sensor-specific power supply states.
+        assert_eq!(status(0x08, 0x6F, 0x00), Status::Ok);
+        assert_eq!(status(0x08, 0x6F, 0x01), Status::Crit);
+    }
+
+    #[test]
+    fn classifies_undecodable_states_by_wording() {
+        assert_eq!(
+            status_from_description("Power supply failure"),
+            Status::Crit
+        );
+        assert_eq!(status_from_description("Predictive failure"), Status::Warn);
+        assert_eq!(status_from_description("Redundancy degraded"), Status::Warn);
+        assert_eq!(status_from_description("Device Present"), Status::Ok);
+        // An unrecognized vendor state must not read as a warning.
+        assert_eq!(status_from_description("vendor state"), Status::Unknown);
     }
 
     #[test]
