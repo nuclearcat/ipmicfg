@@ -649,7 +649,11 @@ pub fn entry_severity(entry: &Entry) -> SelSeverity {
 /// Severity of the state a discrete event offset names, as seen when the sensor
 /// *asserts* it. `None` means the offset carries no fixed meaning and the caller
 /// should fall back to the rendered description.
-fn discrete_state_severity(sensor_type: u8, event_type: u8, offset: u8) -> Option<SelSeverity> {
+pub(crate) fn discrete_state_severity(
+    sensor_type: u8,
+    event_type: u8,
+    offset: u8,
+) -> Option<SelSeverity> {
     // Entity Presence sensors (25h) report inventory, not health, in either the
     // sensor-specific or the generic device-presence form. A BMC restart
     // re-reports every entity it can see, and pins such as BIOS "POST complete"
