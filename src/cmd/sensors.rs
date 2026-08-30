@@ -419,10 +419,9 @@ fn cisco_led_reading(
         match cisco::led_state(offset) {
             Some(state) => {
                 states.push(state.label().to_string());
-                if state.is_color() {
-                    color = Some(state);
-                } else {
-                    lit = Some(state == cisco::LedState::On);
+                match state.lit() {
+                    Some(is_lit) => lit = Some(is_lit),
+                    None => color = Some(state),
                 }
             }
             None => {
@@ -886,6 +885,27 @@ mod tests {
         // set to a colour we cannot name is not claimed to be fine either.
         assert_eq!(read(0x0041).unwrap().0, Status::Unknown);
         assert_eq!(read(0x0002).unwrap().0, Status::Unknown);
+
+        // The identify LED, off and then driven by Chassis Identify. Blinking
+        // is lit, so its unnameable colour keeps the reading unknown either
+        // way rather than flipping to a health claim mid-experiment.
+        assert_eq!(
+            read(0x0041),
+            Some((
+                Status::Unknown,
+                "LED is off, undecoded state 0x06 (raw 0x0041)".into()
+            ))
+        );
+        assert_eq!(
+            read(0x0044),
+            Some((
+                Status::Unknown,
+                "LED is blinking, undecoded state 0x06 (raw 0x0044)".into()
+            ))
+        );
+        // A fault LED blinking amber is still a fault.
+        assert_eq!(read(0x0024).unwrap().0, Status::Warn);
+        assert_eq!(read(0x0014).unwrap().0, Status::Ok);
 
         // Only Cisco's LED sensors take this path.
         assert!(cisco_led_reading(Some(0x002A7C), led_type, led_code, 0x0012).is_none());

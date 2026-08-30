@@ -1051,6 +1051,7 @@ fn cisco_led_indication(entry: &Entry, manufacturer_id: Option<u32>) -> Option<&
     Some(match state {
         cisco::LedState::Off => "LED is no longer off",
         cisco::LedState::On => "LED is no longer on",
+        cisco::LedState::Blinking => "LED is no longer blinking",
         cisco::LedState::Green => "LED color is no longer green",
         cisco::LedState::Amber => "LED color is no longer amber",
         cisco::LedState::Red => "LED color is no longer red",
