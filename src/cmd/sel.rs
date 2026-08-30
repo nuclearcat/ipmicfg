@@ -14,17 +14,29 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::cli::{SelAction, SelArgs, SelSeverity};
-use crate::cmd::{confirm, fujitsu};
+use crate::cmd::{cisco, confirm, fujitsu};
 use crate::conn::Conn;
 use crate::ui::{self, Align, Cell, Table};
 
 type SensorNames = HashMap<(u8, u8), String>;
 type OemDecodedEntries = HashMap<u16, fujitsu::DecodedSelEntry>;
+/// Event Data 1–3 exactly as the BMC sent them, keyed by record ID.
+///
+/// `EventData` keeps only what IPMI 2.0 p. 29.7 defines: the offset, plus bytes
+/// 2 and 3 when byte 1's selector bits say they carry something. For the OEM
+/// sensor class (event/reading types 70h–7Fh) that table leaves bytes 2 and 3 as
+/// optional OEM codes, and vendors routinely leave the selectors at 00b while
+/// still putting payload in them — which the parsed form then drops. Keeping the
+/// wire bytes is the only way to show an undecodable record in full.
+type RawEventData = HashMap<u16, [u8; 3]>;
 
 const DELL_MANUFACTURER_IDS: [u32; 2] = [0x000028, 0x0002A2];
+// IANA 9 and 5771 are both registered to Cisco; UCS servers report 5771.
+const CISCO_MANUFACTURER_IDS: [u32; 2] = [0x000009, cisco::UCS_MANUFACTURER_ID];
 
 struct RenderContext<'a> {
     decoded: &'a OemDecodedEntries,
+    raw_event_data: &'a RawEventData,
     manufacturer_id: Option<u32>,
     args: &'a SelArgs,
     names: &'a SensorNames,
@@ -60,7 +72,49 @@ fn info(conn: &mut Conn) -> Result<(), String> {
         ui::kv("Overflow", &ui::red("yes — events were lost"), 14);
     }
     println!();
+    cisco_esr_info(conn);
     Ok(())
+}
+
+/// Report the Cisco extended SEL repository, which holds the standard records
+/// plus events from sensors that do not fit IPMI's 8-bit sensor number.
+///
+/// Purely informational, and silent on anything that is not a UCS server or
+/// does not answer: probing is best-effort and must never fail `sel info`.
+fn cisco_esr_info(conn: &mut Conn) {
+    if bmc_manufacturer_id(conn) != Some(cisco::UCS_MANUFACTURER_ID) {
+        return;
+    }
+    let Ok(Some(capabilities)) = cisco::esr_capabilities(conn) else {
+        return;
+    };
+    ui::header("Cisco Extended SEL");
+    if !capabilities.enabled {
+        ui::kv("Status", &ui::dim("supported but not enabled"), 14);
+        println!();
+        return;
+    }
+    ui::kv(
+        "Status",
+        &format!(
+            "enabled (API v{}, document {}.{})",
+            capabilities.api_version,
+            capabilities.doc_version_major,
+            capabilities.doc_version_minor
+        ),
+        14,
+    );
+    match cisco::esr_sel_info(conn) {
+        Ok(esr) => {
+            ui::kv("Entries", &esr.entries.to_string(), 14);
+            ui::kv("Free space", &format!("{} bytes", esr.free_bytes), 14);
+            if esr.overflow {
+                ui::kv("Overflow", &ui::red("yes — events were lost"), 14);
+            }
+        }
+        Err(error) => ui::kv("Entries", &ui::dim(&error), 14),
+    }
+    println!();
 }
 
 fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
@@ -78,8 +132,8 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
     let info = conn
         .send_recv(GetSelInfo)
         .map_err(|e| format!("Get SEL Info failed: {e:?}"))?;
-    let entries = if info.entries == 0 {
-        Vec::new()
+    let (entries, raw_event_data) = if info.entries == 0 {
+        (Vec::new(), RawEventData::new())
     } else {
         read_entries(conn)?
     };
@@ -94,6 +148,7 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
         .collect();
     let render = RenderContext {
         decoded: &decoded,
+        raw_event_data: &raw_event_data,
         manufacturer_id,
         args,
         names: &names,
@@ -111,8 +166,8 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
         let current_info = conn
             .send_recv(GetSelInfo)
             .map_err(|e| format!("Get SEL Info failed while following: {e:?}"))?;
-        let current = if current_info.entries == 0 {
-            Vec::new()
+        let (current, raw_event_data) = if current_info.entries == 0 {
+            (Vec::new(), RawEventData::new())
         } else {
             read_entries(conn)?
         };
@@ -127,6 +182,7 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
             let decoded = decode_oem_entries(conn, &fresh, decode_fujitsu_oem);
             let render = RenderContext {
                 decoded: &decoded,
+                raw_event_data: &raw_event_data,
                 manufacturer_id,
                 args,
                 names: &names,
@@ -138,8 +194,9 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
     }
 }
 
-fn read_entries(conn: &mut Conn) -> Result<Vec<Entry>, String> {
+fn read_entries(conn: &mut Conn) -> Result<(Vec<Entry>, RawEventData), String> {
     let mut entries = Vec::new();
+    let mut raw_event_data = RawEventData::new();
     let mut record_id = RecordId::FIRST;
     let mut seen = HashSet::new();
     loop {
@@ -169,6 +226,10 @@ fn read_entries(conn: &mut Conn) -> Result<Vec<Entry>, String> {
         let mut raw = [0u8; 16];
         raw.copy_from_slice(&response.data()[2..18]);
         if raw[2] == 0x02 {
+            // Record the event data bytes before normalizing them, so an
+            // undecodable record can be shown exactly as the BMC reported it.
+            let id = u16::from_le_bytes([raw[0], raw[1]]);
+            raw_event_data.insert(id, [raw[13], raw[14], raw[15]]);
             // IPMI 2.0 p. 29.7 assigns bits 7:6 to Event Data 2 and
             // bits 5:4 to Event Data 3. ipmi-rs currently interprets those two
             // selectors in the opposite order, so normalize the selector bits
@@ -193,7 +254,7 @@ fn read_entries(conn: &mut Conn) -> Result<Vec<Entry>, String> {
         }
         record_id = next;
     }
-    Ok(entries)
+    Ok((entries, raw_event_data))
 }
 
 fn record_id_from_raw(value: u16) -> RecordId {
@@ -283,13 +344,7 @@ fn print_entries(entries: Vec<Entry>, render: &RenderContext<'_>, heading: Optio
                 continue;
             }
         }
-        push_entry(
-            &mut table,
-            &entries[i],
-            render.names,
-            render.decoded,
-            render.manufacturer_id,
-        );
+        push_entry(&mut table, &entries[i], render);
         i += 1;
     }
 
@@ -369,19 +424,29 @@ fn displayed_severity(
     decoded: &OemDecodedEntries,
     manufacturer_id: Option<u32>,
 ) -> SelSeverity {
-    match decoded
+    if let Some(severity) = decoded
         .get(&entry_id(entry).value())
         .map(|entry| entry.severity)
     {
-        Some(fujitsu::Severity::Informational) => SelSeverity::Normal,
-        Some(fujitsu::Severity::Minor) => SelSeverity::Warning,
-        Some(fujitsu::Severity::Major | fujitsu::Severity::Critical) => SelSeverity::Critical,
-        Some(fujitsu::Severity::Unknown) => SelSeverity::Unknown,
-        None if dell_oem_diagnostic_description(entry, manufacturer_id).is_some() => {
-            SelSeverity::Normal
-        }
-        None => entry_severity(entry),
+        return match severity {
+            fujitsu::Severity::Informational => SelSeverity::Normal,
+            fujitsu::Severity::Minor => SelSeverity::Warning,
+            fujitsu::Severity::Major | fujitsu::Severity::Critical => SelSeverity::Critical,
+            fujitsu::Severity::Unknown => SelSeverity::Unknown,
+        };
     }
+    if dell_oem_diagnostic_description(entry, manufacturer_id).is_some() {
+        return SelSeverity::Normal;
+    }
+    // An LED only reflects a condition the detecting sensor logs in its own
+    // right, and CIMC asserts a colour on LEDs that are switched off (a fault
+    // LED sits at "red" while dark), so a colour on its own is not a fault.
+    // Report these as informational rather than double-counting or inventing a
+    // warning on every BMC start.
+    if cisco_led_indication(entry, manufacturer_id).is_some() {
+        return SelSeverity::Normal;
+    }
+    entry_severity(entry)
 }
 
 fn matches_entry(
@@ -409,9 +474,9 @@ fn matches_entry(
             haystack.push(' ');
             haystack.push_str(&oem.text);
         }
-        if let Some(dell) = dell_oem_diagnostic_description(entry, manufacturer_id) {
+        if let Some(vendor) = vendor_description(entry, manufacturer_id) {
             haystack.push(' ');
-            haystack.push_str(&dell);
+            haystack.push_str(&vendor);
         }
         if !haystack
             .to_ascii_lowercase()
@@ -813,26 +878,25 @@ fn oem_text_group(entries: &[Entry]) -> Option<OemText> {
     })
 }
 
-fn push_entry(
-    table: &mut Table,
-    entry: &Entry,
-    names: &SensorNames,
-    decoded: &OemDecodedEntries,
-    manufacturer_id: Option<u32>,
-) {
+fn push_entry(table: &mut Table, entry: &Entry, render: &RenderContext<'_>) {
+    let decoded = render.decoded;
+    let manufacturer_id = render.manufacturer_id;
     match entry {
         Entry::System {
             record_id,
             timestamp,
             ..
         } => {
-            let sensor = entry_sensor(entry, names);
+            let sensor = entry_sensor(entry, render.names);
             let oem = decoded.get(&record_id.value());
             let desc = match oem {
                 Some(oem) if oem.css => format!("{} (CSS component)", oem.text),
                 Some(oem) => oem.text.clone(),
-                None => dell_oem_diagnostic_description(entry, manufacturer_id)
-                    .unwrap_or_else(|| display_entry_description(entry)),
+                None => entry_row_description(
+                    entry,
+                    manufacturer_id,
+                    render.raw_event_data.get(&record_id.value()).copied(),
+                ),
             };
             let (severity, rendered_severity) =
                 severity_label(displayed_severity(entry, decoded, manufacturer_id));
@@ -885,6 +949,76 @@ pub fn entry_description(entry: &Entry) -> String {
         return description;
     }
     Desc(entry).to_string()
+}
+
+/// The text shown in the EVENT column: the spec's decoding where it applies,
+/// then vendor decoding, and finally the raw event data for records nothing
+/// could decode.
+fn entry_row_description(
+    entry: &Entry,
+    manufacturer_id: Option<u32>,
+    raw_event_data: Option<[u8; 3]>,
+) -> String {
+    vendor_description(entry, manufacturer_id)
+        .unwrap_or_else(|| display_entry_description(entry, raw_event_data))
+}
+
+/// Vendor-specific text for records the IPMI spec leaves undefined.
+fn vendor_description(entry: &Entry, manufacturer_id: Option<u32>) -> Option<String> {
+    dell_oem_diagnostic_description(entry, manufacturer_id)
+        .or_else(|| cisco_led_indication(entry, manufacturer_id).map(str::to_string))
+}
+
+/// Decode Cisco CIMC LED sensors, which are Platform Alert sensors (24h)
+/// reported with the OEM event/reading type 7Fh.
+///
+/// The offsets are documented by example in the *Cisco UCS Faults and Error
+/// Messages Reference Guide*, "SEL Record Examples → LED Color Changes", which
+/// prints raw SEL records beside CIMC's own translation of them:
+///
+/// ```text
+/// .. 24 56 7f 00 04 10  ->  Platform alert LED_MEZZ_TP_FLT #0x56 | LED is off
+/// .. 24 56 7f 07 04 10  ->  Platform alert LED_MEZZ_TP_FLT #0x56 | LED color is red
+/// .. 24 58 7f 04 04 10  ->  Platform alert LED_SYS_ACT #0x58     | LED color is green
+/// .. 24 5a 7f 05 04 10  ->  Platform alert LED_SAS1_FAULT #0x5a  | LED color is amber
+/// ```
+///
+/// Offset 01h is not in that list, but it is the complement of 00h and shows up
+/// as such in practice: a healthy C-series reads 0x12 on every `LED_*_STATUS`
+/// sensor, which is offsets 01h and 04h asserted — "on" plus "green".
+/// Offsets 02h, 03h and 06h stay undecoded rather than guessed.
+fn cisco_led_indication(entry: &Entry, manufacturer_id: Option<u32>) -> Option<&'static str> {
+    if !manufacturer_id.is_some_and(|id| CISCO_MANUFACTURER_IDS.contains(&id)) {
+        return None;
+    }
+    let Entry::System {
+        sensor_type,
+        event_direction,
+        event_type,
+        event_data,
+        ..
+    } = entry
+    else {
+        return None;
+    };
+    if *sensor_type != 0x24 || *event_type != 0x7F {
+        return None;
+    }
+
+    let asserted = matches!(event_direction, EventDirection::Assert);
+    Some(match (event_data.offset, asserted) {
+        (0x00, true) => "LED is off",
+        (0x00, false) => "LED is no longer off",
+        (0x01, true) => "LED is on",
+        (0x01, false) => "LED is no longer on",
+        (0x04, true) => "LED color is green",
+        (0x04, false) => "LED color is no longer green",
+        (0x05, true) => "LED color is amber",
+        (0x05, false) => "LED color is no longer amber",
+        (0x07, true) => "LED color is red",
+        (0x07, false) => "LED color is no longer red",
+        _ => return None,
+    })
 }
 
 fn dell_oem_diagnostic_description(entry: &Entry, manufacturer_id: Option<u32>) -> Option<String> {
@@ -998,7 +1132,7 @@ fn system_firmware_progress_description(entry: &Entry) -> Option<String> {
     Some(detail.to_string())
 }
 
-fn display_entry_description(entry: &Entry) -> String {
+fn display_entry_description(entry: &Entry, raw: Option<[u8; 3]>) -> String {
     let decoded = entry_description(entry);
     if !decoded.is_empty() {
         return decoded;
@@ -1023,7 +1157,13 @@ fn display_entry_description(entry: &Entry) -> String {
         0x70..=0x7F => "OEM",
         _ => "unknown",
     };
-    let extra = event_data.to_string();
+    // The wire bytes are a strict superset of the parsed event data, so prefer
+    // them whenever we have them: this branch runs only for records nothing
+    // decoded, where the raw payload is the one thing a reader can act on.
+    let extra = match raw {
+        Some([data1, data2, data3]) => format!("data {data1:02X} {data2:02X} {data3:02X}"),
+        None => event_data.to_string(),
+    };
     if extra.is_empty() {
         format!(
             "{direction} {kind} event (type 0x{event_type:02X}, offset 0x{:02X})",
@@ -1149,8 +1289,8 @@ pub fn health_summary(conn: &mut Conn, recent_limit: usize) -> Result<HealthSumm
     let info = conn
         .send_recv(GetSelInfo)
         .map_err(|e| format!("Get SEL Info failed: {e:?}"))?;
-    let entries = if info.entries == 0 {
-        Vec::new()
+    let (entries, raw_event_data) = if info.entries == 0 {
+        (Vec::new(), RawEventData::new())
     } else {
         read_entries(conn)?
     };
@@ -1167,7 +1307,10 @@ pub fn health_summary(conn: &mut Conn, recent_limit: usize) -> Result<HealthSumm
             format!(
                 "0x{:04X}: {}",
                 entry_id(entry).value(),
-                display_entry_description(entry)
+                display_entry_description(
+                    entry,
+                    raw_event_data.get(&entry_id(entry).value()).copied()
+                )
             )
         })
         .collect::<Vec<_>>();
@@ -1457,9 +1600,173 @@ mod tests {
     fn preserves_undecoded_event_context_without_guessing_severity() {
         let entry = system_event(EventDirection::Assert, 0x6F, 0x0E);
         assert_eq!(entry_severity(&entry), SelSeverity::Unknown);
-        let description = display_entry_description(&entry);
+        let description = display_entry_description(&entry, None);
         assert!(description.contains("asserted sensor-specific event"));
         assert!(description.contains("offset 0x0E"));
+    }
+
+    /// Decode a 16-byte SEL record the way `read_entries` does.
+    fn cisco_record(raw: &str) -> (Entry, [u8; 3]) {
+        let mut bytes = [0u8; 16];
+        for (i, byte) in raw.split(' ').enumerate() {
+            bytes[i] = u8::from_str_radix(byte, 16).expect("hex byte");
+        }
+        assert_eq!(bytes[2], 0x02, "documented records are all SEL type 02h");
+        let event_data = [bytes[13], bytes[14], bytes[15]];
+        bytes[13] = swap_event_data_selectors(bytes[13]);
+        (Entry::parse(&bytes).expect("valid record"), event_data)
+    }
+
+    /// Every SEL record Cisco prints in "SEL Record Examples" in the *UCS
+    /// Faults and Error Messages Reference Guide*, checked against the
+    /// translation Cisco prints beside it. This is the only vendor-published
+    /// ground truth for how a real CIMC renders its own log, so it pins the
+    /// whole path: offset decoding, assert/deassert direction, and severity.
+    #[test]
+    fn matches_cisco_documented_sel_record_examples() {
+        use SelSeverity::{Critical, Normal};
+        let cisco = Some(0x00168B);
+        // (record, Cisco's translation, severity we infer for it)
+        let documented = [
+            // Device presence changes, shown as a boot-up sequence.
+            (
+                "54 01 02 3c 0c 00 00 01 00 04 12 83 6f 01 ff 00",
+                "OEM System Boot Event",
+                Normal,
+            ),
+            (
+                "55 01 02 3d 0c 00 00 20 00 04 25 53 08 01 ff ff",
+                "Device Inserted / Device Present",
+                Normal,
+            ),
+            (
+                "56 01 02 54 0c 00 00 20 00 04 25 52 08 00 ff ff",
+                "Device Removed / Device Absent",
+                Normal,
+            ),
+            // LED colour changes.
+            (
+                "34 05 02 2f 00 00 00 20 00 04 24 56 7f 00 04 10",
+                "LED is off",
+                Normal,
+            ),
+            (
+                "35 05 02 30 00 00 00 20 00 04 24 56 7f 07 04 10",
+                "LED color is red",
+                Normal,
+            ),
+            (
+                "36 05 02 30 00 00 00 20 00 04 24 58 7f 00 04 10",
+                "LED is off",
+                Normal,
+            ),
+            (
+                "37 05 02 31 00 00 00 20 00 04 24 58 7f 04 04 10",
+                "LED color is green",
+                Normal,
+            ),
+            (
+                "39 05 02 32 00 00 00 20 00 04 24 5a 7f 05 04 10",
+                "LED color is amber",
+                Normal,
+            ),
+            // Voltage threshold crossing and its recovery.
+            (
+                "7b 09 02 3d 19 00 00 20 00 04 02 00 01 52 b5 b7",
+                "Lower Critical - going low",
+                Critical,
+            ),
+            (
+                "8d 09 02 5b 19 00 00 20 00 04 02 00 81 52 bc b7",
+                "Lower Critical - going low",
+                Normal,
+            ),
+            // Thermal trip limits, on a chip set and on a processor sensor.
+            (
+                "00 02 02 2b 00 00 00 20 00 04 19 18 05 00 ff ff",
+                "Limit Not Exceeded",
+                Normal,
+            ),
+            (
+                "12 02 02 31 00 00 00 20 00 04 07 19 05 00 ff ff",
+                "Limit Not Exceeded",
+                Normal,
+            ),
+        ];
+
+        for (raw, expected, expected_severity) in documented {
+            let (entry, event_data) = cisco_record(raw);
+            assert_eq!(
+                entry_row_description(&entry, cisco, Some(event_data)),
+                expected,
+                "record {raw}"
+            );
+            assert_eq!(
+                displayed_severity(&entry, &OemDecodedEntries::new(), cisco),
+                expected_severity,
+                "record {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_cisco_led_indications() {
+        let cisco = Some(0x00168B);
+        let decoded = OemDecodedEntries::new();
+
+        // The exact records Cisco documents beside CIMC's own translation.
+        for (offset, expected) in [
+            (0x00, "LED is off"),
+            (0x04, "LED color is green"),
+            (0x05, "LED color is amber"),
+            (0x07, "LED color is red"),
+        ] {
+            let entry = sensor_event(0x24, EventDirection::Assert, 0x7F, offset);
+            assert_eq!(vendor_description(&entry, cisco).as_deref(), Some(expected));
+        }
+
+        // A PSU fault flips a status LED from green to amber in one second:
+        // assert 05h, deassert 04h. Neither half is a fault in its own right —
+        // the sensor that detected it logs that separately.
+        let to_amber = sensor_event(0x24, EventDirection::Assert, 0x7F, 0x05);
+        let left_green = sensor_event(0x24, EventDirection::Deassert, 0x7F, 0x04);
+        assert_eq!(
+            vendor_description(&left_green, cisco).as_deref(),
+            Some("LED color is no longer green")
+        );
+        for entry in [&to_amber, &left_green] {
+            assert_eq!(
+                displayed_severity(entry, &decoded, cisco),
+                SelSeverity::Normal
+            );
+        }
+
+        // Undocumented offsets stay undecoded, as does the same record on a
+        // BMC that is not Cisco's.
+        let unknown_offset = sensor_event(0x24, EventDirection::Assert, 0x7F, 0x03);
+        assert!(vendor_description(&unknown_offset, cisco).is_none());
+        assert!(vendor_description(&to_amber, Some(0x002A7C)).is_none());
+        assert!(vendor_description(&to_amber, None).is_none());
+        assert_eq!(
+            displayed_severity(&to_amber, &decoded, None),
+            SelSeverity::Unknown
+        );
+    }
+
+    #[test]
+    fn shows_wire_event_data_for_oem_records() {
+        // An OEM event type with the data-2/data-3 selectors left at 00b: the
+        // parsed form drops both payload bytes, so only the wire bytes can show
+        // what the BMC actually reported.
+        let entry = sensor_event(0xDC, EventDirection::Assert, 0x74, 0x07);
+        let parsed_only = display_entry_description(&entry, None);
+        assert_eq!(parsed_only, "asserted OEM event (type 0x74, offset 0x07)");
+
+        let description = display_entry_description(&entry, Some([0x07, 0x12, 0xA0]));
+        assert_eq!(
+            description,
+            "asserted OEM event (type 0x74, offset 0x07; data 07 12 A0)"
+        );
     }
 
     #[test]

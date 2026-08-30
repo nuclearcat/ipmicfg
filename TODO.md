@@ -61,6 +61,13 @@ automate, and more complete for day-to-day server management.
     progress checkpoints as informational.
   - [x] Distinguish Dell OEM diagnostic companion records from Link Tuning
     failures and preserve their service-data bytes.
+  - [x] Show the raw event data bytes for records nothing can decode, including
+    the bytes IPMI's Event Data 1 selectors mark as unspecified.
+  - [x] Decode Cisco CIMC LED indications, and check the decoder against the SEL
+    records Cisco publishes with their official translation.
+  - [ ] Read the Cisco Extended Sensor Range repositories (ESR-SEL and ESR-SDR)
+    to name sensors that IPMI's 8-bit sensor number cannot address. Capability
+    and repository probing is done; the record readers are not.
   - Preserve raw fields in JSON output, including OEM data.
 
 - [x] Expand `status` into a health summary.
