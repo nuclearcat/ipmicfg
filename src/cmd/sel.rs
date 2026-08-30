@@ -18,7 +18,51 @@ use crate::cmd::{cisco, confirm, fujitsu};
 use crate::conn::Conn;
 use crate::ui::{self, Align, Cell, Table};
 
-type SensorNames = HashMap<(u8, u8), String>;
+/// Sensor names from the SDR repository.
+///
+/// Keyed by `(sensor type, sensor number)` because a sensor number is only
+/// unique per owner and LUN — a board can have both a Temperature 7 and a
+/// Fan 7. A SEL record names the same pair, so the exact key is the right
+/// lookup, with a guarded fallback for controllers that disagree with
+/// themselves about a sensor's type. See [`SensorNames::get`].
+#[derive(Default)]
+struct SensorNames {
+    by_type_and_number: HashMap<(u8, u8), String>,
+    /// Names keyed by sensor number alone. `None` marks a number that more
+    /// than one SDR record claims, where a name cannot be chosen safely.
+    by_number: HashMap<u8, Option<String>>,
+}
+
+impl SensorNames {
+    fn insert(&mut self, sensor_type: u8, sensor_number: u8, name: String) {
+        self.by_number
+            .entry(sensor_number)
+            .and_modify(|existing| {
+                // Two records under one number: only ambiguous if they disagree.
+                if existing.as_deref() != Some(name.as_str()) {
+                    *existing = None;
+                }
+            })
+            .or_insert_with(|| Some(name.clone()));
+        self.by_type_and_number
+            .insert((sensor_type, sensor_number), name);
+    }
+
+    /// Look up the name a SEL record's sensor was given in the SDR.
+    ///
+    /// Falls back to the sensor number alone when the exact pair is absent.
+    /// A BMC can log an event under a different sensor type than the one its
+    /// own SDR record declares — Cisco does this for OEM sensor types — which
+    /// otherwise leaves a named sensor rendered as a bare number. The fallback
+    /// only applies when exactly one SDR record uses that number, so it can
+    /// never pick between two sensors that merely share one.
+    fn get(&self, sensor_type: u8, sensor_number: u8) -> Option<&str> {
+        self.by_type_and_number
+            .get(&(sensor_type, sensor_number))
+            .map(String::as_str)
+            .or_else(|| self.by_number.get(&sensor_number)?.as_deref())
+    }
+}
 type OemDecodedEntries = HashMap<u16, fujitsu::DecodedSelEntry>;
 /// Event Data 1–3 exactly as the BMC sent them, keyed by record ID.
 ///
@@ -353,25 +397,29 @@ fn print_entries(entries: Vec<Entry>, render: &RenderContext<'_>, heading: Optio
 }
 
 fn sensor_names(conn: &mut Conn) -> Result<SensorNames, String> {
-    Ok(conn
-        .collect_sdrs()?
-        .iter()
-        .filter_map(|record| match &record.contents {
-            RecordContents::FullSensor(sensor) => Some((
-                ((*sensor.ty()).into(), sensor.key_data().sensor_number.get()),
+    let mut names = SensorNames::default();
+    for record in conn.collect_sdrs()?.iter() {
+        let (sensor_type, sensor_number, id) = match &record.contents {
+            RecordContents::FullSensor(sensor) => (
+                (*sensor.ty()).into(),
+                sensor.key_data().sensor_number.get(),
                 sensor.id_string().to_string(),
-            )),
-            RecordContents::CompactSensor(sensor) => Some((
-                ((*sensor.ty()).into(), sensor.key_data().sensor_number.get()),
+            ),
+            RecordContents::CompactSensor(sensor) => (
+                (*sensor.ty()).into(),
+                sensor.key_data().sensor_number.get(),
                 sensor.id_string().to_string(),
-            )),
-            RecordContents::EventOnlySensor(sensor) => Some((
-                (sensor.ty.into(), sensor.key.sensor_number.get()),
+            ),
+            RecordContents::EventOnlySensor(sensor) => (
+                sensor.ty.into(),
+                sensor.key.sensor_number.get(),
                 sensor.id_string.to_string(),
-            )),
-            _ => None,
-        })
-        .collect())
+            ),
+            _ => continue,
+        };
+        names.insert(sensor_type, sensor_number, id);
+    }
+    Ok(names)
 }
 
 fn bmc_manufacturer_id(conn: &mut Conn) -> Option<u32> {
@@ -532,7 +580,7 @@ fn entry_sensor(entry: &Entry, names: &SensorNames) -> String {
             ..
         } => {
             let ty = SensorType::from(*sensor_type);
-            match names.get(&(*sensor_type, *sensor_number)) {
+            match names.get(*sensor_type, *sensor_number) {
                 Some(name) => format!("{name} ({ty} #{sensor_number})"),
                 None => format!("{ty} #{sensor_number}"),
             }
@@ -1882,16 +1930,25 @@ mod tests {
 
     #[test]
     fn sensor_names_are_keyed_by_type_and_number() {
-        let mut names = SensorNames::new();
-        names.insert((0x01, 7), "Temperature 7".to_string());
-        names.insert((0x04, 7), "Fan 7".to_string());
+        let mut names = SensorNames::default();
+        names.insert(0x01, 7, "Temperature 7".to_string());
+        names.insert(0x04, 7, "Fan 7".to_string());
         let entry = system_event(EventDirection::Assert, 0x01, 0);
         let Entry::System { sensor_number, .. } = &entry else {
             unreachable!()
         };
         assert_eq!(*sensor_number, 1);
-        names.insert((0x01, 1), "CPU Temp".to_string());
+        names.insert(0x01, 1, "CPU Temp".to_string());
         assert!(entry_sensor(&entry, &names).starts_with("CPU Temp"));
+
+        // Two sensors share number 7, so neither can be chosen for a SEL
+        // record whose sensor type matches neither of them.
+        assert_eq!(names.get(0xDC, 7), None);
+        // Only one sensor has number 1, so a type the SDR disagrees with still
+        // resolves rather than rendering as a bare number.
+        assert_eq!(names.get(0xDC, 1), Some("CPU Temp"));
+        assert_eq!(names.get(0x01, 1), Some("CPU Temp"));
+        assert_eq!(names.get(0xDC, 26), None);
     }
 
     #[test]
