@@ -264,6 +264,35 @@ fn add_discrete(
     }
 }
 
+/// Why a sensor's reading carries nothing usable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unavailable {
+    /// Nobody is polling the sensor, so any value it returns is stale.
+    ScanningDisabled,
+    /// The sensor is scanned but has no current reading, typically because its
+    /// first update has not completed.
+    NoReading,
+}
+
+/// Read the availability flags of a Get Sensor Reading response.
+///
+/// IPMI 2.0 p. 35.14 byte 3 mixes polarities: bits 7 and 6 are enables, so a
+/// zero is the bad case ("All Event Messages disabled", "sensor scanning
+/// disabled"), while bit 5 is set when the reading/state is unavailable.
+/// Testing them all the same way turns a sensor nobody scans into an
+/// apparently live reading, so the two are read separately here. Bit 7 only
+/// says whether the sensor emits event messages, which has no bearing on
+/// whether its reading is good.
+fn unavailable_reason(flags: u8) -> Option<Unavailable> {
+    if flags & 0x40 == 0 {
+        Some(Unavailable::ScanningDisabled)
+    } else if flags & 0x20 != 0 {
+        Some(Unavailable::NoReading)
+    } else {
+        None
+    }
+}
+
 fn read_analog(conn: &mut Conn, full: &FullSensorRecord) -> Result<(String, Status), String> {
     let response = send_sensor_raw(conn, full.key_data(), CMD_GET_SENSOR_READING)?;
     if response.cc() != 0 {
@@ -273,18 +302,20 @@ fn read_analog(conn: &mut Conn, full: &FullSensorRecord) -> Result<(String, Stat
     if data.len() < 2 {
         return Err("short response".to_string());
     }
-    let unavailable = data[1] & 0x20 != 0;
-    let status = if unavailable {
-        Status::Unknown
-    } else {
-        classify_threshold_bits(data.get(2).copied().unwrap_or(0))
-    };
-    let text = if unavailable {
-        "n/a".to_string()
-    } else {
-        full.display_reading(data[0])
-            .unwrap_or_else(|| format!("raw 0x{:02X}", data[0]))
-    };
+    // Say which of the two it is rather than printing a bare "n/a": a sensor
+    // for hardware that is not installed reads very differently from one whose
+    // first update has not landed yet.
+    if let Some(reason) = unavailable_reason(data[1]) {
+        let text = match reason {
+            Unavailable::ScanningDisabled => "scanning disabled",
+            Unavailable::NoReading => "unavailable",
+        };
+        return Ok((text.to_string(), Status::Unknown));
+    }
+    let status = classify_threshold_bits(data.get(2).copied().unwrap_or(0));
+    let text = full
+        .display_reading(data[0])
+        .unwrap_or_else(|| format!("raw 0x{:02X}", data[0]));
     Ok((text, status))
 }
 
@@ -297,8 +328,12 @@ fn read_discrete(conn: &mut Conn, sensor: &DiscreteSensor<'_>) -> Result<(Status
     if data.len() < 2 {
         return Err("short response".to_string());
     }
-    if data[1] & 0x20 != 0 {
-        return Ok((Status::Unknown, "state unavailable".to_string()));
+    if let Some(reason) = unavailable_reason(data[1]) {
+        let text = match reason {
+            Unavailable::ScanningDisabled => "scanning disabled",
+            Unavailable::NoReading => "state unavailable",
+        };
+        return Ok((Status::Unknown, text.to_string()));
     }
 
     let raw = u16::from_le_bytes([
@@ -732,6 +767,27 @@ mod tests {
         assert_eq!(status_from_description("Device Present"), Status::Ok);
         // An unrecognized vendor state must not read as a warning.
         assert_eq!(status_from_description("vendor state"), Status::Unknown);
+    }
+
+    #[test]
+    fn reads_availability_flags_with_their_own_polarities() {
+        // Scanning enabled, events enabled, reading present: a usable value.
+        assert_eq!(unavailable_reason(0xC0), None);
+        // Bit 6 clear means scanning is disabled, so the value is stale even
+        // though the active-high "unavailable" bit is clear.
+        assert_eq!(
+            unavailable_reason(0x80),
+            Some(Unavailable::ScanningDisabled)
+        );
+        // Scanned, but with no reading yet.
+        assert_eq!(unavailable_reason(0xE0), Some(Unavailable::NoReading));
+        // Both disabled: not scanning is the more fundamental statement.
+        assert_eq!(
+            unavailable_reason(0x00),
+            Some(Unavailable::ScanningDisabled)
+        );
+        // Event messages disabled says nothing about the reading itself.
+        assert_eq!(unavailable_reason(0x40), None);
     }
 
     #[test]
