@@ -2,6 +2,7 @@
 
 pub mod bmc;
 pub mod boot;
+mod cisco;
 mod fujitsu;
 pub mod identify;
 pub mod inventory;
@@ -69,6 +70,7 @@ pub fn manufacturer_name(id: u32) -> Option<&'static str> {
     Some(match id {
         0x000002 => "IBM",
         0x000009 => "Cisco",
+        0x00168B => "Cisco",
         0x00000B => "HP",
         0x00000E => "Fujitsu Siemens",
         0x000028 => "Dell",
