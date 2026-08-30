@@ -3,7 +3,7 @@
 //! Color output is auto-disabled when stdout is not a TTY, when `NO_COLOR` is set,
 //! or when the user passes `--no-color`.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static COLOR_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -66,6 +66,41 @@ impl Status {
             Status::Crit => red("CRIT"),
             Status::Unknown => dim(" -- "),
         }
+    }
+}
+
+/// A transient one-line status message for operations that take long enough
+/// that a silent terminal looks like a hang.
+///
+/// It goes to stderr so it never contaminates piped output, and only when
+/// stderr is a terminal. Dropping it erases the line, so the message leaves no
+/// trace once the work finishes — including on the early-return paths.
+pub struct Progress {
+    active: bool,
+}
+
+impl Progress {
+    pub fn start(message: &str) -> Self {
+        let active = std::io::stderr().is_terminal();
+        if active {
+            let mut err = std::io::stderr();
+            let _ = write!(err, "{}", dim(message));
+            let _ = err.flush();
+        }
+        Self { active }
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut err = std::io::stderr();
+        // Carriage return plus erase-to-end-of-line: cursor control, not color,
+        // so it is correct even with --no-color or NO_COLOR.
+        let _ = write!(err, "\r\x1b[2K");
+        let _ = err.flush();
     }
 }
 

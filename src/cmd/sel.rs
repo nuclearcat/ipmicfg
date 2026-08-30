@@ -70,6 +70,10 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
         return Err("--since must not be later than --until".to_string());
     }
 
+    // Listing the SEL walks the whole SDR repository first so events can be
+    // labelled with sensor names, then reads every record one at a time. On a
+    // busy BMC that is seconds of silence before the first row appears.
+    let progress = ui::Progress::start("Enumerating, please wait...");
     let names = sensor_names(conn)?;
     let info = conn
         .send_recv(GetSelInfo)
@@ -83,6 +87,7 @@ fn list(conn: &mut Conn, args: &SelArgs) -> Result<(), String> {
     let decode_fujitsu_oem =
         !args.no_oem_decode && manufacturer_id.is_some_and(fujitsu::is_fujitsu_manufacturer);
     let decoded = decode_oem_entries(conn, &entries, decode_fujitsu_oem);
+    drop(progress);
     let mut known: HashSet<u16> = entries
         .iter()
         .map(|entry| entry_id(entry).value())
