@@ -13,7 +13,7 @@ use ipmi_rs::storage::sel::{
 };
 
 use crate::cli::{SelSeverity, SensorState, SensorsArgs};
-use crate::cmd::sel;
+use crate::cmd::{bmc_manufacturer_id, cisco, sel};
 use crate::conn::Conn;
 use crate::ui::{self, Align, Cell, Status, Table};
 
@@ -82,6 +82,7 @@ fn render(conn: &mut Conn, args: &SensorsArgs) -> Result<(), String> {
     );
     let mut hidden_discrete = 0usize;
     let mut counts = Counts::default();
+    let manufacturer_id = bmc_manufacturer_id(conn);
 
     for record in &records {
         match &record.contents {
@@ -99,6 +100,7 @@ fn render(conn: &mut Conn, args: &SensorsArgs) -> Result<(), String> {
                         &mut discrete,
                         &mut hidden_discrete,
                         &mut counts,
+                        manufacturer_id,
                         DiscreteSensor {
                             ty: *full.ty(),
                             type_name: ty,
@@ -162,6 +164,7 @@ fn render(conn: &mut Conn, args: &SensorsArgs) -> Result<(), String> {
                     &mut discrete,
                     &mut hidden_discrete,
                     &mut counts,
+                    manufacturer_id,
                     DiscreteSensor {
                         ty: *sensor.ty(),
                         type_name: ty,
@@ -183,6 +186,7 @@ fn render(conn: &mut Conn, args: &SensorsArgs) -> Result<(), String> {
                     &mut discrete,
                     &mut hidden_discrete,
                     &mut counts,
+                    manufacturer_id,
                     DiscreteSensor {
                         ty: sensor.ty,
                         type_name: ty,
@@ -239,10 +243,11 @@ fn add_discrete(
     table: &mut Table,
     hidden: &mut usize,
     counts: &mut Counts,
+    manufacturer_id: Option<u32>,
     sensor: DiscreteSensor<'_>,
 ) {
     verbose_read(args, &sensor.type_name, &sensor.name, "discrete");
-    let reading = read_discrete(conn, &sensor);
+    let reading = read_discrete(conn, &sensor, manufacturer_id);
     if let Err(error) = &reading {
         if args.verbose {
             eprintln!("{} {}: {error}", ui::yellow("warning:"), sensor.name);
@@ -317,7 +322,11 @@ fn read_analog(conn: &mut Conn, full: &FullSensorRecord) -> Result<(String, Stat
     Ok((text, status))
 }
 
-fn read_discrete(conn: &mut Conn, sensor: &DiscreteSensor<'_>) -> Result<(Status, String), String> {
+fn read_discrete(
+    conn: &mut Conn,
+    sensor: &DiscreteSensor<'_>,
+    manufacturer_id: Option<u32>,
+) -> Result<(Status, String), String> {
     let response = send_sensor_raw(conn, sensor.key, CMD_GET_SENSOR_READING)?;
     if response.cc() != 0 {
         return Err(format!("completion code 0x{:02X}", response.cc()));
@@ -340,6 +349,12 @@ fn read_discrete(conn: &mut Conn, sensor: &DiscreteSensor<'_>) -> Result<(Status
     ]);
     if raw == 0 {
         return Ok((Status::Ok, "none (raw 0x0000)".to_string()));
+    }
+
+    if let Some((status, text)) =
+        cisco_led_reading(manufacturer_id, sensor.ty, sensor.event_code, raw)
+    {
+        return Ok((status, text));
     }
 
     if has_unknown_semantics(sensor.event_code) {
@@ -366,6 +381,71 @@ fn read_discrete(conn: &mut Conn, sensor: &DiscreteSensor<'_>) -> Result<(Status
         status,
         format!("{} (raw 0x{raw:04X})", descriptions.join(", ")),
     ))
+}
+
+/// Decode a Cisco LED sensor's asserted state bits.
+///
+/// A reading carries both of the LED's fields at once — lit or dark, and the
+/// colour it is set to — which a SEL record cannot show, because it reports one
+/// offset per event. Seeing the pair is what makes a health judgement possible:
+/// CIMC assigns a colour to LEDs that are switched off, so a fault LED sits at
+/// amber while dark, and the colour only means something once the LED is lit.
+///
+/// An LED whose colour we cannot name stays unknown while lit, but counts as
+/// healthy while dark: the colour does not matter if nothing is showing.
+fn cisco_led_reading(
+    manufacturer_id: Option<u32>,
+    sensor_type: SensorType,
+    event_code: EventReadingTypeCodes,
+    raw: u16,
+) -> Option<(Status, String)> {
+    if manufacturer_id != Some(cisco::UCS_MANUFACTURER_ID)
+        || u8::from(sensor_type) != cisco::LED_SENSOR_TYPE
+        || event_code_value(event_code) != cisco::LED_EVENT_TYPE
+    {
+        return None;
+    }
+
+    let mut states = Vec::new();
+    let mut color = None;
+    let mut lit = None;
+    let mut undecoded = false;
+    for offset in 0..15u8 {
+        if raw & (1 << offset) == 0 {
+            continue;
+        }
+        match cisco::led_state(offset) {
+            Some(state) => {
+                states.push(state.label().to_string());
+                if state.is_color() {
+                    color = Some(state);
+                } else {
+                    lit = Some(state == cisco::LedState::On);
+                }
+            }
+            None => {
+                states.push(format!("undecoded state 0x{offset:02X}"));
+                undecoded = true;
+            }
+        }
+    }
+
+    let status = match (lit, color) {
+        (Some(false), _) => Status::Ok,
+        (Some(true), Some(cisco::LedState::Green)) => Status::Ok,
+        (Some(true), Some(cisco::LedState::Amber)) => Status::Warn,
+        (Some(true), Some(cisco::LedState::Red)) => Status::Crit,
+        // Lit in a colour we cannot name, or a mask with no lit state at all.
+        _ => Status::Unknown,
+    };
+    // A state we could not decode may be the one that matters, so never call
+    // such a reading healthy.
+    let status = if undecoded && status == Status::Ok {
+        Status::Unknown
+    } else {
+        status
+    };
+    Some((status, format!("{} (raw 0x{raw:04X})", states.join(", "))))
 }
 
 fn discrete_description(
@@ -613,6 +693,9 @@ impl Counts {
 pub fn health_summary(conn: &mut Conn) -> Result<Counts, String> {
     let records = conn.collect_sdrs()?;
     let mut counts = Counts::default();
+    // Read vendor tables here too, so the counts in `status` match what
+    // `sensors` shows rather than drifting from it.
+    let manufacturer_id = bmc_manufacturer_id(conn);
     for record in &records {
         match &record.contents {
             RecordContents::FullSensor(full) => {
@@ -628,7 +711,7 @@ pub fn health_summary(conn: &mut Conn) -> Result<Counts, String> {
                         event_code: *full.event_reading_type_codes(),
                         key: full.key_data(),
                     };
-                    read_discrete(conn, &item)
+                    read_discrete(conn, &item, manufacturer_id)
                         .map(|(status, _)| status)
                         .unwrap_or(Status::Unknown)
                 };
@@ -643,7 +726,7 @@ pub fn health_summary(conn: &mut Conn) -> Result<Counts, String> {
                     key: sensor.key_data(),
                 };
                 counts.tally(
-                    read_discrete(conn, &item)
+                    read_discrete(conn, &item, manufacturer_id)
                         .map(|(status, _)| status)
                         .unwrap_or(Status::Unknown),
                 );
@@ -657,7 +740,7 @@ pub fn health_summary(conn: &mut Conn) -> Result<Counts, String> {
                     key: &sensor.key,
                 };
                 counts.tally(
-                    read_discrete(conn, &item)
+                    read_discrete(conn, &item, manufacturer_id)
                         .map(|(status, _)| status)
                         .unwrap_or(Status::Unknown),
                 );
@@ -765,6 +848,54 @@ mod tests {
         assert_eq!(status_from_description("Device Present"), Status::Ok);
         // An unrecognized vendor state must not read as a warning.
         assert_eq!(status_from_description("vendor state"), Status::Unknown);
+    }
+
+    #[test]
+    fn judges_cisco_led_readings_by_lit_state_and_color() {
+        let led_type = SensorType::from(cisco::LED_SENSOR_TYPE);
+        let led_code = EventReadingTypeCodes::Oem(cisco::LED_EVENT_TYPE);
+        let read =
+            |raw| cisco_led_reading(Some(cisco::UCS_MANUFACTURER_ID), led_type, led_code, raw);
+
+        // The masks a healthy C240 M4 actually reports: a status LED lit green,
+        // and a fault LED dark but coloured amber.
+        assert_eq!(
+            read(0x0012),
+            Some((
+                Status::Ok,
+                "LED is on, LED color is green (raw 0x0012)".into()
+            ))
+        );
+        assert_eq!(
+            read(0x0021),
+            Some((
+                Status::Ok,
+                "LED is off, LED color is amber (raw 0x0021)".into()
+            ))
+        );
+
+        // Lit is what makes the colour mean something.
+        assert_eq!(read(0x0022).unwrap().0, Status::Warn);
+        assert_eq!(read(0x0082).unwrap().0, Status::Crit);
+        // Dark stays healthy whatever colour it is set to.
+        assert_eq!(read(0x0081).unwrap().0, Status::Ok);
+
+        // An undecoded state is never called healthy while lit, and a dark LED
+        // set to a colour we cannot name is not claimed to be fine either.
+        assert_eq!(read(0x0041).unwrap().0, Status::Unknown);
+        assert_eq!(read(0x0002).unwrap().0, Status::Unknown);
+
+        // Only Cisco's LED sensors take this path.
+        assert!(cisco_led_reading(Some(0x002A7C), led_type, led_code, 0x0012).is_none());
+        assert!(cisco_led_reading(None, led_type, led_code, 0x0012).is_none());
+        // A Cisco sensor that is not an LED sensor.
+        assert!(cisco_led_reading(
+            Some(cisco::UCS_MANUFACTURER_ID),
+            SensorType::from(0x07),
+            led_code,
+            0x0012
+        )
+        .is_none());
     }
 
     #[test]
