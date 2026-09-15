@@ -19,6 +19,7 @@ use cli::{Cli, Command};
 use conn::Conn;
 
 fn main() -> std::process::ExitCode {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     ui::init_color(cli.no_color);
 
@@ -28,6 +29,17 @@ fn main() -> std::process::ExitCode {
             eprintln!("{} {}", ui::red("error:"), e);
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// Rust masks `SIGPIPE` at startup, which turns a closed stdout (`ipmicfg sensors | head`)
+/// into a panic on the next print. Restore the default disposition so the process exits
+/// quietly the way every other command-line tool does.
+fn restore_default_sigpipe() {
+    // SAFETY: `signal` with `SIG_DFL` is async-signal-safe and runs before any threads
+    // are spawned; it only resets a disposition Rust's runtime set for us.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
