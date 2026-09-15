@@ -125,6 +125,10 @@ ipmicfg user list --channel 1
 ipmicfg user privilege 3 administrator --channel 1
 ipmicfg user password 3              # hidden prompt; no password in argv
 
+# Enable IPMI-over-LAN for a user on the dedicated management channel
+ipmicfg user privilege 3 administrator --channel 3 --ipmi-messaging on
+ipmicfg user enable 3
+
 # Power control (destructive actions confirm first)
 ipmicfg power                      # show power state
 ipmicfg power on
@@ -164,6 +168,11 @@ state.
   display-only.
 - User passwords are prompted without echo or read from `--password-file` and
   are limited to the broadly compatible 16-byte IPMI password form.
+- `user privilege` preserves the access bits you do not mention. A user needs
+  `--ipmi-messaging on` before it can open an IPMI-over-LAN session; privilege
+  alone is not enough. `--link-auth` toggles link authentication the same way.
+  Some BMCs (Intel's S2600 family) reject the three-byte Set User Access request
+  with completion code `0xC7`; the four-byte form is sent automatically on retry.
 - Logical FRUs are decoded through Get FRU Inventory commands. Physical I2C FRU
   locators are listed, but direct EEPROM access is not attempted.
 - Threshold-sensor health is derived from IPMI threshold status bits. Discrete

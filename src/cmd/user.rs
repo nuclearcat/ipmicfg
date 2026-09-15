@@ -4,7 +4,7 @@ use std::path::Path;
 
 use ipmi_rs::connection::NetFn;
 
-use crate::cli::{UserAction, UserArgs, UserPrivilege};
+use crate::cli::{Toggle, UserAction, UserArgs, UserPrivilege};
 use crate::cmd::confirm;
 use crate::conn::Conn;
 use crate::ui::{self, Align, Cell, Table};
@@ -24,8 +24,18 @@ pub fn run(conn: &mut Conn, args: &UserArgs) -> Result<(), String> {
             user_id,
             level,
             channel,
+            ipmi_messaging,
+            link_auth,
             yes,
-        } => privilege(conn, *user_id, *level, *channel, *yes),
+        } => privilege(
+            conn,
+            *user_id,
+            *level,
+            *channel,
+            *ipmi_messaging,
+            *link_auth,
+            *yes,
+        ),
         UserAction::Name { user_id, name, yes } => set_name(conn, *user_id, name, *yes),
         UserAction::Password {
             user_id,
@@ -194,34 +204,99 @@ fn privilege(
     user_id: u8,
     level: UserPrivilege,
     channel: u8,
+    ipmi_messaging: Option<Toggle>,
+    link_auth: Option<Toggle>,
     yes: bool,
 ) -> Result<(), String> {
     validate_channel(channel)?;
-    if !yes
-        && !confirm(&format!(
-            "Set user {user_id} privilege on channel {channel} to {}?",
-            privilege_name(privilege_value(level))
-        ))
-    {
-        println!("Aborted.");
-        return Ok(());
-    }
     let current = get_access(conn, channel, user_id)?;
-    let flags = 0x80
-        | if current.callback_only { 0x40 } else { 0 }
-        | if current.link_auth { 0x20 } else { 0 }
-        | if current.ipmi_messaging { 0x10 } else { 0 }
-        | (channel & 0x0F);
+    // Bits the caller did not mention keep whatever the BMC already has.
+    let want_messaging = ipmi_messaging.map_or(current.ipmi_messaging, Toggle::is_on);
+    let want_link_auth = link_auth.map_or(current.link_auth, Toggle::is_on);
+
+    if !yes {
+        let mut prompt = format!(
+            "Set user {user_id} privilege on channel {channel} to {}",
+            privilege_name(privilege_value(level))
+        );
+        if want_messaging != current.ipmi_messaging {
+            prompt.push_str(&format!(", IPMI messaging {}", on_off(want_messaging)));
+        }
+        if want_link_auth != current.link_auth {
+            prompt.push_str(&format!(", link auth {}", on_off(want_link_auth)));
+        }
+        prompt.push('?');
+        if !confirm(&prompt) {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let flags = access_flags(
+        channel,
+        current.callback_only,
+        want_link_auth,
+        want_messaging,
+    );
+    set_user_access(conn, flags, user_id, privilege_value(level))?;
+    println!("{} user privilege updated", ui::green("OK:"));
+    if want_messaging != current.ipmi_messaging {
+        println!("  IPMI messaging {}", on_off(want_messaging));
+    }
+    if want_link_auth != current.link_auth {
+        println!("  link authentication {}", on_off(want_link_auth));
+    }
+    Ok(())
+}
+
+/// Send Set User Access, falling back to the four-byte form when the BMC insists on it.
+///
+/// IPMI 2.0 p. 22.26 marks the trailing user session limit byte optional, but some
+/// controllers (Intel's S2600 family among them) reject the three-byte request with
+/// `0xC7`, request data length invalid (p. 5.2, Table 5-2). Retry with an explicit
+/// "no session limit" byte — 0h, "only limited by the implementation" — rather than
+/// failing.
+fn set_user_access(conn: &mut Conn, flags: u8, user_id: u8, privilege: u8) -> Result<(), String> {
+    const CC_REQUEST_DATA_LENGTH_INVALID: u8 = 0xC7;
+    const NO_SESSION_LIMIT: u8 = 0x00;
+
     let response = conn
         .send_raw(
             NetFn::App,
             CMD_SET_USER_ACCESS,
-            vec![flags, user_id, privilege_value(level)],
+            vec![flags, user_id, privilege],
         )
         .map_err(|e| format!("Set User Access failed: {e}"))?;
-    check(response.cc(), "Set User Access")?;
-    println!("{} user privilege updated", ui::green("OK:"));
-    Ok(())
+    if response.cc() != CC_REQUEST_DATA_LENGTH_INVALID {
+        return check(response.cc(), "Set User Access");
+    }
+
+    let response = conn
+        .send_raw(
+            NetFn::App,
+            CMD_SET_USER_ACCESS,
+            vec![flags, user_id, privilege, NO_SESSION_LIMIT],
+        )
+        .map_err(|e| format!("Set User Access failed: {e}"))?;
+    check(response.cc(), "Set User Access")
+}
+
+/// Byte 1 of Set User Access (IPMI 2.0 p. 22.26): bit 7 enables changing the bits
+/// below it, bit 6 restricts the user to callback, bit 5 is link authentication,
+/// bit 4 is IPMI messaging, and bits 3:0 select the channel.
+fn access_flags(channel: u8, callback_only: bool, link_auth: bool, ipmi_messaging: bool) -> u8 {
+    0x80 | if callback_only { 0x40 } else { 0 }
+        | if link_auth { 0x20 } else { 0 }
+        | if ipmi_messaging { 0x10 } else { 0 }
+        | (channel & 0x0F)
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "enabled"
+    } else {
+        "disabled"
+    }
 }
 
 fn set_name(conn: &mut Conn, user_id: u8, name: &str, yes: bool) -> Result<(), String> {
@@ -370,6 +445,31 @@ mod tests {
         assert_eq!(quiet.enabled, UserEnabled::Unspecified);
         let reserved = Access::parse(&[16, 0xC4, 2, 0x34]).unwrap();
         assert_eq!(reserved.enabled, UserEnabled::Unspecified);
+    }
+
+    #[test]
+    fn enables_ipmi_messaging_without_disturbing_other_access_bits() {
+        let current = Access::parse(&[16, 4, 2, 0x04]).unwrap();
+        assert!(!current.ipmi_messaging);
+        assert!(!current.link_auth);
+
+        // `--ipmi-messaging on` with link auth left unspecified.
+        let want_messaging = Some(Toggle::On).map_or(current.ipmi_messaging, Toggle::is_on);
+        let want_link_auth = None.map_or(current.link_auth, Toggle::is_on);
+        assert!(want_messaging);
+        assert!(!want_link_auth);
+
+        let flags = access_flags(3, current.callback_only, want_link_auth, want_messaging);
+        assert_eq!(flags, 0x93);
+    }
+
+    #[test]
+    fn unspecified_toggles_preserve_the_current_access_bits() {
+        let current = Access::parse(&[16, 4, 2, 0x34]).unwrap();
+        let want_messaging = None.map_or(current.ipmi_messaging, Toggle::is_on);
+        let want_link_auth = None.map_or(current.link_auth, Toggle::is_on);
+        let flags = access_flags(1, current.callback_only, want_link_auth, want_messaging);
+        assert_eq!(flags, 0xB1);
     }
 
     #[test]
