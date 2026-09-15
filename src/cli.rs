@@ -474,6 +474,14 @@ pub enum UserAction {
         level: UserPrivilege,
         #[arg(short, long, default_value_t = 1)]
         channel: u8,
+        /// Allow the user to open IPMI messaging sessions on this channel.
+        /// Required for IPMI-over-LAN; left unchanged when not given.
+        #[arg(long, value_name = "ON|OFF")]
+        ipmi_messaging: Option<Toggle>,
+        /// Require link authentication for the user on this channel.
+        /// Left unchanged when not given.
+        #[arg(long, value_name = "ON|OFF")]
+        link_auth: Option<Toggle>,
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
@@ -501,6 +509,19 @@ pub enum UserAction {
         #[arg(long)]
         yes: bool,
     },
+}
+
+/// An optional on/off switch for a user-access bit that is otherwise preserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Toggle {
+    On,
+    Off,
+}
+
+impl Toggle {
+    pub fn is_on(self) -> bool {
+        matches!(self, Toggle::On)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
