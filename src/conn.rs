@@ -100,6 +100,11 @@ impl Conn {
 
     /// Collect the SDR repository while rejecting repeated record IDs.
     ///
+    /// A BMC may answer a request for a missing record ID with the next
+    /// record that exists (Fujitsu iRMC does this when a record's "next ID"
+    /// points into a gap), so the returned ID can differ from the requested
+    /// one. Accept that, as ipmitool does, but fail if a record comes back twice.
+    ///
     /// Normally each record is requested in one operation. Some BMCs (notably
     /// Cisco CIMC) reject the conventional `bytes to read = 0xFF` request with
     /// completion code 0xCA. Only in that case, reserve the repository and
@@ -107,6 +112,7 @@ impl Conn {
     pub fn collect_sdrs(&mut self) -> Result<Vec<sdr::Record>, String> {
         let mut records = Vec::new();
         let mut seen = HashSet::new();
+        let mut received = HashSet::new();
         let mut record_id = 0u16;
         let mut chunked = None;
 
@@ -137,11 +143,10 @@ impl Conn {
             let parsed = sdr::Record::parse(&result.data).map_err(|error| {
                 format!("failed to parse SDR record 0x{record_id:04X}: {error:?}")
             })?;
-            // Record ID 0x0000 is the protocol's "first record" selector, so
-            // the first returned record may have a different concrete ID.
-            if !sdr_record_id_matches(record_id, parsed.header.id.value()) {
+            if !received.insert(parsed.header.id.value()) {
                 return Err(format!(
-                    "SDR record ID mismatch: requested 0x{record_id:04X}, received 0x{:04X}",
+                    "SDR repository cycle detected: request for 0x{record_id:04X} \
+                     returned already-read record 0x{:04X}",
                     parsed.header.id.value()
                 ));
             }
@@ -368,10 +373,6 @@ fn parse_sdr_response(record_id: u16, response: &[u8]) -> Result<SdrRead, String
     })
 }
 
-fn sdr_record_id_matches(requested: u16, actual: u16) -> bool {
-    requested == 0 || requested == actual
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,12 +390,5 @@ mod tests {
         let response = parse_sdr_response(1, &[2, 0, 1, 0, 0x51, 1, 0x3A]).unwrap();
         assert_eq!(response.next_id, 2);
         assert_eq!(response.data, [1, 0, 0x51, 1, 0x3A]);
-    }
-
-    #[test]
-    fn first_record_selector_accepts_concrete_record_id() {
-        assert!(sdr_record_id_matches(0, 1));
-        assert!(sdr_record_id_matches(2, 2));
-        assert!(!sdr_record_id_matches(2, 3));
     }
 }

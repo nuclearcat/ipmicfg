@@ -3,12 +3,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use ipmi_rs::connection::NetFn;
+use ipmi_rs::connection::{CompletionErrorCode, NetFn};
 use ipmi_rs::storage::sdr::record::{IdentifiableSensor, InstancedSensor, RecordContents};
 use ipmi_rs::storage::sdr::{EventData2Type, EventData3Type, SensorType};
 use ipmi_rs::storage::sel::{
     ClearSel, Entry, ErasureProgress, EventDirection, GetSelInfo, RecordId, ReserveSel, SelCommand,
 };
+use ipmi_rs::IpmiError;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -1214,6 +1215,19 @@ fn display_entry_description(entry: &Entry, raw: Option<[u8; 3]>) -> String {
     }
 }
 
+/// How long to wait for the BMC to finish erasing the SEL.
+const CLEAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn is_node_busy<C, P>(error: &IpmiError<C, P>) -> bool {
+    matches!(
+        error,
+        IpmiError::Failed {
+            completion_code: CompletionErrorCode::NodeBusy,
+            ..
+        }
+    )
+}
+
 fn clear(conn: &mut Conn, yes: bool) -> Result<(), String> {
     let info = conn
         .send_recv(GetSelInfo)
@@ -1248,7 +1262,16 @@ fn clear(conn: &mut Conn, yes: bool) -> Result<(), String> {
         .send_recv(ClearSel::initiate(reservation))
         .map_err(|e| format!("Clear SEL failed: {e:?}"))?;
 
+    // Some BMCs (seen on a Lenovo server) answer Node Busy (0xC0) to SEL
+    // commands while the erase runs, so treat that as "still erasing".
+    let deadline = std::time::Instant::now() + CLEAR_TIMEOUT;
     while matches!(progress, ErasureProgress::InProgress) {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "SEL erase still in progress after {}s",
+                CLEAR_TIMEOUT.as_secs()
+            ));
+        }
         std::thread::sleep(std::time::Duration::from_millis(150));
         // Initiating the erase changes the repository and therefore cancels
         // the reservation used for that command. Some BMCs tolerate reusing
@@ -1256,16 +1279,19 @@ fn clear(conn: &mut Conn, yes: bool) -> Result<(), String> {
         // CIMC reject it with 0xC5. Acquire a fresh reservation for every
         // status request because a Clear SEL command may cancel it again.
         let status_reservation = if info.supported_cmds.contains(&SelCommand::Reserve) {
-            Some(
-                conn.send_recv(ReserveSel)
-                    .map_err(|e| format!("Reserve SEL for status failed: {e:?}"))?,
-            )
+            match conn.send_recv(ReserveSel) {
+                Ok(reservation) => Some(reservation),
+                Err(e) if is_node_busy(&e) => continue,
+                Err(e) => return Err(format!("Reserve SEL for status failed: {e:?}")),
+            }
         } else {
             None
         };
-        progress = conn
-            .send_recv(ClearSel::get_status(status_reservation))
-            .map_err(|e| format!("Clear SEL status failed: {e:?}"))?;
+        progress = match conn.send_recv(ClearSel::get_status(status_reservation)) {
+            Ok(progress) => progress,
+            Err(e) if is_node_busy(&e) => continue,
+            Err(e) => return Err(format!("Clear SEL status failed: {e:?}")),
+        };
     }
 
     println!("{}", ui::green("SEL cleared."));
